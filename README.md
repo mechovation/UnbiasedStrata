@@ -51,13 +51,15 @@ make build                           # build/bin/{strata,strata-poly,strata-dsv4
 make test                            # the front end against a fake engine; no GPU, no model
 ```
 
+The frontend requires installed **OpenSSL 3 development files** and runtime CA certificates; it never downloads a TLS implementation. Remote image URLs use verified HTTPS, a 10-MiB source cap, and a shared 10-second acquisition deadline. LAN/loopback sources require explicit `STRATA_IMAGE_ALLOWED_CIDRS`; a private CA can be supplied with `STRATA_IMAGE_CA_BUNDLE`. See [PR3 policy and tests](frontend/tests/PR3.md) before configuring image egress.
+
 ## Box setup — CliffsNotes
 
 Guest, both cards:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends git cmake build-essential gcc-13 nvidia-cuda-toolkit linux-headers-amd64
+sudo apt-get install -y --no-install-recommends git cmake build-essential gcc-13 nvidia-cuda-toolkit linux-headers-amd64 libssl-dev openssl ca-certificates
 python3 -m venv ~/venv-strata && ~/venv-strata/bin/pip install -r tools/requirements.txt   # offline pack tools only
 nvcc --version | tail -1                                        # CUDA 12.4.131
 g++-13 --version | head -1                                      # template default is 14.2; nvcc 12.4 accepts <= 13 (#1645)

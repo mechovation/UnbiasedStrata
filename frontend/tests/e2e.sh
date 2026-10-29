@@ -176,5 +176,9 @@ t=$(curl -s "$URL/tokenize" -H 'content-type: application/json' -d '{"content":"
 d=$(curl -s "$URL/detokenize" -H 'content-type: application/json' -d "{\"tokens\":$t}" | j 'd["content"]')
 check $([ "$d" = "Hello, world!" ] && echo 0 || echo 1) "tokenize/detokenize round trip: $t"
 
+# Gated queue/admission regressions launch isolated CPU/no-model servers on ephemeral ports.
+python3 "$HERE/queue-lifecycle.py" "$BIN" "$MODEL"
+check $? "queue lifecycle and pre-GEN context admission"
+
 if [ $fail = 0 ]; then echo "e2e: all checks passed"; else echo "--- server log"; tail -40 "$LOG"; echo "--- slow server log"; tail -20 "$SLOW_LOG"; echo "--- template server log"; tail -20 "$TPL_LOG"; fi
 exit $fail

@@ -7,6 +7,7 @@
 #include "engine.hpp"
 #include "literals.hpp"
 #include "picture_cache.hpp"
+#include "acquisition_request.hpp"
 
 #include "server-common.h"
 #include "server-task.h"
@@ -292,38 +293,29 @@ struct strata_context_impl {
 
     // mirrors launch_slot_with_task
     void launch(server_task && task) {
-        slot.release();
+        GGML_ASSERT(!slot.active());
         slot.task = std::make_unique<server_task>(std::move(task));
         const server_task & t = *slot.task;
 
         if (!engine.alive()) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
-            slot.release();
+            finish_slot();
             return;
         }
 
         const int32_t n_prompt = t.n_tokens();
         if (n_prompt == 0) {
             send_error(t, "the prompt is empty", ERROR_TYPE_INVALID_REQUEST);
-            slot.release();
+            finish_slot();
             return;
         }
-        std::vector<int32_t> ids;
-        if (t.tokens.has_mtmd) {
-            std::string ierr;
-            if (!encode_pictures(t, ids, ierr)) {
-                send_error(t, ierr, ERROR_TYPE_SERVER);
-                slot.release();
-                return;
-            }
-        } else {
-            ids = t.tokens.get_text_tokens();
-        }
+        // n_tokens() includes every image token cell, not just text or compressed M-RoPE positions.
+        // Reject known context overflow before copying tokens, encoding pictures or creating their file.
         const long long room = n_ctx - n_prompt - ENGINE_CONTEXT_RESERVE;
         if (room <= 0) {
             send_error(t, string_format("the request exceeds the available context size: %d prompt tokens, context %lld (%d kept back)",
                                         n_prompt, n_ctx, ENGINE_CONTEXT_RESERVE), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-            slot.release();
+            finish_slot();
             return;
         }
         // n_predict: -1 and anything past the context become what is left, as llama-server does
@@ -333,6 +325,47 @@ struct strata_context_impl {
                 SRV_WRN("n_predict %d exceeds the room left in the context, lowered to %lld\n", slot.n_predict, room);
             }
             slot.n_predict = (int32_t) room;
+        }
+        // has_mtmd advertises tokenization capability, not actual media. Validate every placeholder span
+        // before writing/encoding anything; get_text_tokens() alone would silently strip unsupported media.
+        bool has_images = false;
+        for (size_t i = 0; i < t.tokens.size();) {
+            if (t.tokens[i] != LLAMA_TOKEN_NULL) {
+                ++i;
+                continue;
+            }
+            const mtmd_input_chunk * ch = image_chunk(t, i);
+            if (ch == nullptr) {
+                send_error(t, "unsupported or missing media chunk; only pictures are supported", ERROR_TYPE_NOT_SUPPORTED);
+                finish_slot();
+                return;
+            }
+            const size_t n = mtmd_input_chunk_get_n_tokens(ch);
+            if (n == 0 || n > t.tokens.size() - i) {
+                send_error(t, "invalid picture token layout", ERROR_TYPE_INVALID_REQUEST);
+                finish_slot();
+                return;
+            }
+            for (size_t j = i; j < i + n; ++j) {
+                if (t.tokens[j] != LLAMA_TOKEN_NULL) {
+                    send_error(t, "invalid picture token layout", ERROR_TYPE_INVALID_REQUEST);
+                    finish_slot();
+                    return;
+                }
+            }
+            has_images = true;
+            i += n;
+        }
+        std::vector<int32_t> ids;
+        if (has_images) {
+            std::string ierr;
+            if (!encode_pictures(t, ids, ierr)) {
+                send_error(t, ierr, ERROR_TYPE_SERVER);
+                finish_slot();
+                return;
+            }
+        } else {
+            ids = t.tokens.get_text_tokens();
         }
         if (!t.params.sampling.grammar.grammar.empty()) {
             // the engine samples inside its own process and exposes no logits: a grammar (tools, json_schema,
@@ -344,7 +377,7 @@ struct strata_context_impl {
         const std::string header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
         if (!engine.send_request(header, ids)) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
-            slot.release();
+            finish_slot();
             return;
         }
         slot.started = true;
@@ -656,7 +689,7 @@ struct strata_context_impl {
         slot.cancelled = true;
         if (!engine.stop()) {
             // the engine is gone; the supervisor will report it
-            slot.release();
+            finish_slot();
         }
     }
 
@@ -834,7 +867,11 @@ struct strata_context_impl {
     }
 
     void finish_slot() {
+        if (!slot.active()) {
+            return;
+        }
         slot.release();
+        // Return capacity exactly once. Promotion only enqueues: launch failures must not recurse.
         queue_tasks.pop_deferred_task(-1);
     }
 
@@ -1436,7 +1473,12 @@ void strata_context::init_routes(server_http_context & http) {
 
     // a control token's text inside a message stays text (literals.hpp): marked before the template renders,
     // unmarked after, and the spans it covered are tokenized as text
-    auto parse_chat = [I](json & body, std::vector<raw_buffer> & files, std::vector<std::pair<size_t, size_t>> & plain) {
+    auto parse_chat = [I](json & body, std::vector<raw_buffer> & files, std::vector<std::pair<size_t, size_t>> & plain,
+                          const std::function<bool()> & cancelled) {
+        // Acquire before templating, preserving occurrence order. No service headers are forwarded.
+        if (I->chat_params.allow_image) {
+            strata_acquisition::acquire_images(body, strata_acquisition::Policy::environment(), cancelled);
+        }
         bool marked = false;
         if (body.contains("messages")) {
             json * tools = body.contains("tools") ? &body.at("tools") : nullptr;
@@ -1456,8 +1498,17 @@ void strata_context::init_routes(server_http_context & http) {
         std::vector<raw_buffer> files;
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
-        json body_parsed = parse_chat(body, files, plain);
-        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
+        try {
+            json body_parsed = parse_chat(body, files, plain, req.should_stop);
+            return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
+        } catch (const strata_acquisition::Error & e) {
+            auto res = I->create_response();
+            auto error = format_error_response(e.what(), e.status < 500 ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER);
+            error["code"] = e.status;
+            res->error(error);
+            res->status = e.status;
+            return res;
+        }
     };
 
     auto post_completions_oai = [I](const server_http_req & req) {
@@ -1477,8 +1528,15 @@ void strata_context::init_routes(server_http_context & http) {
         std::vector<raw_buffer> files;
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
-        json data = parse_chat(body, files, plain);
-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        try {
+            json data = parse_chat(body, files, plain, req.should_stop);
+            res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        } catch (const strata_acquisition::Error & e) {
+            auto error = format_error_response(e.what(), e.status < 500 ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER);
+            error["code"] = e.status;
+            res->error(error);
+            res->status = e.status;
+        }
         return res;
     };
 

@@ -63,7 +63,7 @@ build: configure
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target $(TARGETS)
 	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(BUILD_DIR)/bin/strata-dsv41 $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/unbiased-strata
 
-# The front end alone, without CUDA: for a laptop or a CI box. Needs only a C++20 compiler and CMake.
+# The front end alone, without CUDA: needs a C++20 compiler, CMake and installed OpenSSL 3 development files.
 .PHONY: frontend
 frontend:
 	cmake -S . -B $(BUILD_DIR)-frontend -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF \
@@ -79,6 +79,7 @@ test: frontend
 	$(BUILD_DIR)-frontend/bin/literals_test
 	$(BUILD_DIR)-frontend/bin/picture_cache_test
 	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/unbiased-strata
+	bash frontend/tests/acquisition.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

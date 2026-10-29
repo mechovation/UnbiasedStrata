@@ -9,6 +9,8 @@ bench/micro/*.bin
 bench/micro/*.dll
 bench/micro/*.txt
 *.log
+/secrets/
+/.env
 build*/
 pack/
 logs/
