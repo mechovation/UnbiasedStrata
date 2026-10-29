@@ -80,6 +80,12 @@ test: frontend
 	$(BUILD_DIR)-frontend/bin/picture_cache_test
 	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/unbiased-strata
 	bash frontend/tests/acquisition.sh
+	bash frontend/tests/pr4-foundations.sh
+
+# Standalone Linux/glibc PR4 CPU foundations; no CMake, models, services, or GPU.
+.PHONY: test-pr4
+test-pr4:
+	bash frontend/tests/pr4-foundations.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

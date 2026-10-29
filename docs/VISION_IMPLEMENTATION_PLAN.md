@@ -1,10 +1,10 @@
 # Vision improvement implementation plan
 
-**Status: planning complete; no implementation authorized or performed.**
+**Original planning snapshot; subsequent implementation status:** PR1–3 and Spike A are checkpointed, and PR4 CPU foundations are in progress. See [the PR4 handoff](PR4_HANDOFF.md) for current authorization, evidence and remaining gates. PR4 is incomplete; PR5–7 remain excluded.
 
 Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf60f0`, llama.cpp submodule `44072a19fb94d0bed63d381d42f6237373f91d54`. This is the technical execution plan, not a replacement for the [behavioral specification](VISION_STACK_REVIEW.md), [performance evidence](VISION_STACK_BENCHMARK.md), or [issue reproductions](VISION_ISSUE_VALIDATION.md).
 
-**Next session:** obtain authorization for **PR1 only**, implement/test/review that scope, then stop for review. Do not interpret this document as approval to implement every phase. Local operational/session details are in `deployment/VISION_HANDOFF.md`, excluded from an upstream PR by default.
+**Historical initial gate:** the original plan called for authorization of **PR1 only**. That gate was followed by separately authorized prerequisite and PR4 foundation work; resume from the current handoff above, not this old scheduling instruction. This plan is not approval to implement every phase or deploy. Local operational/session details are in `deployment/VISION_HANDOFF.md`, intentionally excluded from the public checkpoint.
 
 ## 1. Constraints and decisions
 
