@@ -1,0 +1,221 @@
+// Included by vision-native.cpp: actual request handler, server_queue, slot and
+// response reader. All decoder/encoder work remains in the real reader child.
+static void queue_scenario(const char * executable, const char * guard, const char * model_path, const char * projector_path,
+    const vision_payload::Config & config, const vision_payload::Limits & caps, const llama_vocab * vocab, int32_t pad,
+    const std::string & prompt, const std::vector<std::pair<size_t,size_t>> & plain, const std::vector<raw_buffer> & sources) {
+    namespace vq = vision_queue;
+    char name[] = "/tmp/pr4-native-queue-XXXXXX"; assert(::mkdtemp(name)); const std::string gate = name;
+    const auto before_encode = encodes(), before_commands = calls('G');
+    strata_context context; auto & ctx = *context.impl;
+    ctx.vocab = vocab; ctx.n_ctx = 1024; ctx.model_name = "native-cpu-fixture"; ctx.image_pad_id = pad; ctx.init_literals(); ctx.metrics.init();
+    auto artifacts = std::make_shared<vision_artifact::Budget>(vision_artifact::Usage{64*1024*1024, 32});
+    auto recipes = std::make_shared<io::RecipeBudget>(io::RecipeBudget::Usage{128*1024, 8});
+    std::shared_ptr<CpuOnlySafety> safety;
+    vs::Launch reader{guard, executable, {executable,"reader",model_path,projector_path,"cpu"},
+        {"CUDA_VISIBLE_DEVICES=-1","NVIDIA_VISIBLE_DEVICES=void","PR4_NATIVE_COUNTER="+counter,"PR4_NATIVE_ENCODE_HOLD="+gate+"/hold"}, 200, config, caps};
+    ea::Launch engine{guard, executable, {executable,"engine",gate},
+        {"CUDA_VISIBLE_DEVICES=-1","NVIDIA_VISIBLE_DEVICES=void","PR4_NATIVE_COUNTER="+counter}};
+    ea::Limits engine_limits{4*1024*1024,4096,16384,64,config.vocabulary_size,10s,1s,1s};
+    ctx.native_vision = std::make_unique<vq::Bridge>(ctx.queue_owner, reader, vs::Limits{180s,1s,1s,5s,50ms,600s,3}, engine,
+        engine_limits, vq::Limits{8,1024*1024,128,16,32768,16*1024*1024,65536,{65536,16384,32768},180s,180s,180s,5s,10s},
+        2, vocab, pad, get_media_marker(), [vocab](const std::string & text) {
+            llama_tokens ids; strata_context_impl::tokenize_plain(vocab,text,ids); return ids;
+        }, artifacts, recipes, [&](std::shared_ptr<ea::Adapter> adapter) {
+            safety = std::make_shared<CpuOnlySafety>(); safety->adapter = std::move(adapter); return safety;
+        });
+    common_params blocked; std::string startup_error;
+    assert(!context.start_engine(blocked,"/not-opened",{},startup_error) && startup_error.find("native pipeline") != std::string::npos);
+    assert(!context.load(blocked,startup_error) && startup_error.find("native startup") != std::string::npos);
+    ctx.queue_tasks.on_new_task([&](server_task && task, bool yielding) { return ctx.process_new_task(std::move(task),yielding); });
+    ctx.queue_tasks.on_update_slots([&] { ctx.update_slots(); });
+    std::thread main_queue([&] { context.start_loop(); });
+    assert(ctx.native_vision->recover());
+    await([&] { return ctx.native_vision->available(); }); // READY drained with NO active slot
+    auto metrics = [&] {
+        const int id = ctx.queue_tasks.get_new_id(); ctx.queue_results.add_waiting_task_id(id);
+        server_task task(SERVER_TASK_TYPE_METRICS); task.id = id; ctx.queue_tasks.post(std::move(task));
+        server_task_result_ptr result;
+        await([&] { result = ctx.queue_results.recv_with_timeout({id},1); return bool(result); });
+        auto * value = dynamic_cast<server_task_result_metrics *>(result.get()); assert(value);
+        auto counts = std::pair{value->n_processing_slots,value->n_tasks_deferred};
+        ctx.queue_results.remove_waiting_task_id(id); return counts;
+    };
+    struct Response { int status; bool streaming; std::string data; };
+    auto request = [&](std::string text, bool streaming, std::shared_ptr<std::atomic<bool>> disconnected) {
+        return std::async(std::launch::async,[&,text=std::move(text),streaming,disconnected] {
+            std::function<bool()> stop = [disconnected] { return disconnected->load(); };
+            server_http_req req{{},{},"/v1/chat/completions","","",{},stop};
+            json data{{"prompt",text},{"n_predict",1},{"temperature",0},{"stream",streaming}};
+            auto result = ctx.handle_completions(req,data,sources,TASK_RESPONSE_TYPE_OAI_CMPL,plain);
+            Response response{result->status,result->is_stream(),{}};
+            if (!result->is_stream()) response.data = result->data;
+            else {
+                for (;;) {
+                    std::string chunk; bool more = result->next(chunk); response.data += chunk;
+                    if (!more) break;
+                }
+            }
+            return response; // req/stop remain alive until result destruction
+        });
+    };
+    auto live = [] { return std::make_shared<std::atomic<bool>>(false); };
+    auto a = request(prompt,false,live());
+    await([&] { return ::access((gate+"/entered").c_str(),F_OK) == 0; });
+    std::string oversized = prompt; for (unsigned i = 0; i < 4000; ++i) oversized += " xyz";
+    auto b = request(oversized,true,live()); // context refusal must remain pre-SSE 400
+    auto c = request(prompt,true,live());
+    auto disconnect_queued = live(); auto cancelled_queued = request(prompt,false,disconnect_queued);
+    await([&] { return metrics() == std::pair{1,3}; }); // actual deferral, no sleeps
+    disconnect_queued->store(true);
+    assert(cancelled_queued.wait_for(5s) == std::future_status::ready); (void)cancelled_queued.get();
+    await([&] { return metrics() == std::pair{1,2}; });
+    assert(calls('G') == before_commands+1 && encodes() == before_encode+3);
+    { std::ofstream release(gate+"/release"); release << '1'; }
+    assert(a.wait_for(30s) == std::future_status::ready && b.wait_for(30s) == std::future_status::ready && c.wait_for(30s) == std::future_status::ready);
+    auto ra = a.get(), rb = b.get(), rc = c.get();
+    assert(ra.status == 200 && rb.status == 400 && !rb.streaming && rc.status == 200 && rc.streaming);
+    assert(rc.data.find("[DONE]") != std::string::npos);
+    assert(encodes() == before_encode+6 && calls('G') == before_commands+2); // no B/queued-cancel encode or GEN
+
+    // Client observer cancels an outstanding real ENCODE, independently of the
+    // queue. The test holds only after real encoding; parent must kill/reap it.
+    { std::ofstream hold(gate+"/hold"); hold << '1'; }
+    auto disconnect_active = live(); const auto encoded_before_cancel = encodes();
+    auto cancelled_active = request(prompt,false,disconnect_active);
+    await([&] { return encodes() > encoded_before_cancel; });
+    auto follower = request(prompt,false,live());
+    await([&] { return metrics() == std::pair{1,1}; });
+    disconnect_active->store(true);
+    assert(cancelled_active.wait_for(5s) == std::future_status::ready); (void)cancelled_active.get();
+    assert(follower.wait_for(15s) == std::future_status::ready && follower.get().status == 503);
+    await([&] { return metrics() == std::pair{0,0}; });
+    assert(calls('G') == before_commands+2 && !ctx.native_vision->available());
+    ::unlink((gate+"/hold").c_str());
+    std::this_thread::sleep_for(60ms); // injected explicit recovery cooldown, not a race assertion
+    assert(ctx.native_vision->recover()); await([&] { return ctx.native_vision->available(); });
+    auto recovered = request(prompt,false,live());
+    assert(recovered.wait_for(30s) == std::future_status::ready && recovered.get().status == 200);
+    assert(calls('G') == before_commands+3);
+
+    // After GENI: STOP once, drain residual output, retain the old slot/files,
+    // and do not prepare or generate the deferred successor before DONE.
+    const auto before_engine_cancel = encodes(), before_stop = calls('S');
+    { std::ofstream cancel(gate+"/cancel"); cancel << '1'; }
+    auto disconnect_engine = live(); auto active_engine = request(prompt,false,disconnect_engine);
+    await([&] { return ::access((gate+"/active").c_str(),F_OK) == 0; });
+    auto after_engine = request(prompt,false,live());
+    await([&] { return metrics() == std::pair{1,1}; });
+    disconnect_engine->store(true);
+    assert(active_engine.wait_for(5s) == std::future_status::ready); (void)active_engine.get();
+    await([&] { return ::access((gate+"/draining").c_str(),F_OK) == 0; });
+    assert(calls('S') == before_stop+1 && encodes() == before_engine_cancel+3);
+    assert(metrics() == std::pair(1,1) && after_engine.wait_for(100ms) == std::future_status::timeout);
+    ::unlink((gate+"/cancel").c_str());
+    { std::ofstream release(gate+"/drain-release"); release << '1'; }
+    assert(after_engine.wait_for(30s) == std::future_status::ready && after_engine.get().status == 200);
+    assert(calls('G') == before_commands+5 && encodes() == before_engine_cancel+6);
+
+    // A parent output-limit STOP is not request cancellation: a native cancel
+    // terminal still yields one successful final result after certified drain.
+    { std::ofstream soft(gate+"/soft"); soft << '1'; }
+    auto normal_stop = request(prompt,false,live());
+    assert(normal_stop.wait_for(30s) == std::future_status::ready && normal_stop.get().status == 200);
+    assert(calls('S') == before_stop+2 && calls('G') == before_commands+6);
+    // Same resident supervisor/engine: plain/literal text keeps exact legacy
+    // IDs and GEN, with no source decode, projector encode or SVE1 attempt.
+    ::unlink((gate+"/soft").c_str());
+    auto text_request = [&](json text, std::vector<std::pair<size_t,size_t>> spans, bool streaming,
+                            std::shared_ptr<std::atomic<bool>> disconnected) {
+        return std::async(std::launch::async,[&,text=std::move(text),spans=std::move(spans),streaming,disconnected] {
+            std::function<bool()> stop = [disconnected] { return disconnected->load(); };
+            server_http_req req{{},{},"/v1/completions","","",{},stop};
+            auto result = ctx.handle_completions(req,json{{"prompt",text},{"n_predict",1},{"temperature",0},{"stream",streaming}},
+                {},TASK_RESPONSE_TYPE_OAI_CMPL,spans);
+            Response response{result->status,result->is_stream(),{}};
+            if (!result->is_stream()) response.data = result->data;
+            else for (;;) { std::string chunk; bool more = result->next(chunk); response.data += chunk; if (!more) break; }
+            return response;
+        });
+    };
+    auto expect_text = [&](const llama_tokens & ids) {
+        std::ofstream expected(gate+"/expected-text");
+        for (size_t i = 0; i < ids.size(); ++i) { if (i) expected << ','; expected << ids[i]; }
+        expected << '\n'; assert(expected.good());
+    };
+    const llama_tokens raw_ids{42,43,44}; expect_text(raw_ids);
+    // Also defer text behind a real GENI cancellation, not just after an idle
+    // image completion. No text GEN or extra file may overtake its native DONE.
+    ::unlink((gate+"/active").c_str()); ::unlink((gate+"/draining").c_str()); ::unlink((gate+"/drain-release").c_str());
+    { std::ofstream cancel(gate+"/cancel"); cancel << '1'; }
+    const auto before_mixed_text = calls('X');
+    auto mixed_disconnect = live(); auto mixed_image = request(prompt,false,mixed_disconnect);
+    await([&] { return ::access((gate+"/active").c_str(),F_OK) == 0; });
+    const auto mixed_files = calls('F');
+    auto mixed_follower = text_request(raw_ids,{},true,live());
+    await([&] { return metrics() == std::pair{1,1}; });
+    mixed_disconnect->store(true);
+    assert(mixed_image.wait_for(5s) == std::future_status::ready); (void)mixed_image.get();
+    await([&] { return ::access((gate+"/draining").c_str(),F_OK) == 0; });
+    assert(calls('X') == before_mixed_text && calls('F') == mixed_files && metrics() == std::pair(1,1));
+    assert(mixed_follower.wait_for(100ms) == std::future_status::timeout);
+    ::unlink((gate+"/cancel").c_str());
+    { std::ofstream release(gate+"/drain-release"); release << '1'; }
+    assert(mixed_follower.wait_for(30s) == std::future_status::ready && mixed_follower.get().status == 200);
+    assert(calls('X') == before_mixed_text+1 && calls('F') == mixed_files);
+    const auto text_decode = calls('D'), text_encode = encodes(), text_files = calls('F'), text_commands = calls('G'), text_gen = calls('X');
+    assert(text_files > 0); // file observer has a real vision positive control
+    const std::string text = "<|im_start|>user\nLiteral <think> <|image_pad|> <|im_end|> café.\n<|im_start|>assistant\n";
+    for (bool literal : {false,true}) for (bool streaming : {false,true}) {
+        const std::vector<std::pair<size_t,size_t>> spans = literal ?
+            std::vector<std::pair<size_t,size_t>>{{text.find("Literal"),text.find("\n<|im_start|>assistant")}} :
+            std::vector<std::pair<size_t,size_t>>{};
+        auto ids = literal ? ctx.tokenize_prompt(text,spans,{}).get_text_tokens() : common_tokenize(vocab,text,true,true);
+        expect_text(ids);
+        auto response = text_request(text,spans,streaming,live());
+        assert(response.wait_for(30s) == std::future_status::ready); auto value = response.get();
+        assert(value.status == 200 && value.streaming == streaming);
+        if (streaming) assert(value.data.find("[DONE]") != std::string::npos);
+    }
+    expect_text(raw_ids);
+    auto raw = text_request(raw_ids,{},false,live());
+    assert(raw.wait_for(30s) == std::future_status::ready && raw.get().status == 200);
+    for (json refused : {json(""),json(std::string(10000,'x')),json::array({"a","b"})}) {
+        auto rejected = text_request(refused,{},true,live());
+        assert(rejected.wait_for(30s) == std::future_status::ready); auto value = rejected.get();
+        assert(value.status == 400 && !value.streaming);
+    }
+    assert(calls('G') == text_commands+5 && calls('X') == text_gen+5);
+    // Text cancellation uses exactly the same STOP/residual/withheld-DONE gate;
+    // its text follower must not reach GEN before certified terminal/promotion.
+    ::unlink((gate+"/active").c_str()); ::unlink((gate+"/draining").c_str()); ::unlink((gate+"/drain-release").c_str());
+    expect_text(raw_ids);
+    { std::ofstream cancel(gate+"/cancel"); cancel << '1'; }
+    auto text_disconnect = live(); auto cancelled_text = text_request(raw_ids,{},false,text_disconnect);
+    await([&] { return ::access((gate+"/active").c_str(),F_OK) == 0; });
+    auto text_follower = text_request(raw_ids,{},true,live());
+    await([&] { return metrics() == std::pair{1,1}; });
+    text_disconnect->store(true);
+    assert(cancelled_text.wait_for(5s) == std::future_status::ready); (void)cancelled_text.get();
+    await([&] { return ::access((gate+"/draining").c_str(),F_OK) == 0; });
+    assert(calls('G') == text_commands+6 && calls('S') == before_stop+4);
+    assert(metrics() == std::pair(1,1) && text_follower.wait_for(100ms) == std::future_status::timeout);
+    ::unlink((gate+"/cancel").c_str());
+    { std::ofstream release(gate+"/drain-release"); release << '1'; }
+    assert(text_follower.wait_for(30s) == std::future_status::ready && text_follower.get().status == 200);
+    assert(calls('G') == text_commands+7 && calls('X') == text_gen+7);
+    assert(calls('D') == text_decode && encodes() == text_encode && calls('F') == text_files);
+    std::atomic<bool> racing{false};
+    std::thread recovery_race([&] {
+        racing = true;
+        for (unsigned i = 0; i < 1000; ++i) { (void)ctx.native_vision->recover(); std::this_thread::yield(); }
+    });
+    await([&] { return racing.load(); });
+    context.terminate(); main_queue.join(); recovery_race.join();
+    assert(!ctx.slot.active() && ctx.metrics.predict.count == 12 && ctx.queue_tasks.queue_tasks_deferred_size() == 0);
+    ctx.native_vision.reset();
+    assert(safety->adapter->stopped() && !safety->leased && !safety->revoked);
+    assert(artifacts->usage().bytes == 0 && recipes->usage().bytes == 0);
+    for (const auto * file : {"entered","release","active","draining","drain-release","soft","expected-text"}) ::unlink((gate+"/"+file).c_str());
+    assert(::rmdir(gate.c_str()) == 0);
+    std::cout << "PR4_NATIVE_QUEUE_PASS handler=real queue=real slot_results=real pre_sse_context=1 queued_cancel=1 encode_disconnect=1 recovery_success=1 engine_disconnect_drain=1 normal_stop=1 text_gen_parity=1 text_cancel_drain=1 gpu=none\n";
+}

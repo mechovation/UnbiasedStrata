@@ -50,10 +50,18 @@ struct Expected {
     size_t fd_count;
 };
 
+// Optional owner-only observation of another service component during reader IO.
+// Must be bounded, nonblocking, noexcept and non-reentrant; must not touch this
+// channel or destroy its owner. Borrowed context outlives the channel. false
+// poisons the operation just like an IO failure, never authorizes cleanup.
+struct HealthProbe {
+    bool (*check)(void *) noexcept = nullptr;
+    void * context = nullptr;
+};
 class Channel {
 public:
     // Takes ownership. Only connected Unix stream sockets are supported.
-    explicit Channel(int socket) : fd_(socket) {}
+    explicit Channel(int socket, HealthProbe probe = {}) : fd_(socket), probe_(probe) {}
     Channel(const Channel &) = delete;
     Channel & operator=(const Channel &) = delete;
     ~Channel() { close(); }
@@ -61,16 +69,35 @@ public:
 
     IoResult receive(Frame & out, const Expected & expected, uint32_t payload_cap,
                      Clock::time_point deadline, const std::atomic<bool> & cancel) {
-        if (expected.fd_count > max_frame_fds) return fail(IoResult::protocol);
+        return receive_impl(out, &expected, 0, payload_cap, deadline, cancel);
+    }
+    // Reader-side command boundary: fixed command kinds/FD counts and instance
+    // are checked before payload allocation. Job/sequence ordering is enforced
+    // by the reader registry, never inferred from an untrusted payload.
+    IoResult receive_command(Frame & out, uint64_t instance, uint32_t payload_cap,
+                             Clock::time_point deadline, const std::atomic<bool> & cancel) {
+        return receive_impl(out, nullptr, instance, payload_cap, deadline, cancel);
+    }
+private:
+    IoResult receive_impl(Frame & out, const Expected * expected, uint64_t instance, uint32_t payload_cap,
+                          Clock::time_point deadline, const std::atomic<bool> & cancel) {
+        if (expected && expected->fd_count > max_frame_fds) return fail(IoResult::protocol);
         Frame pending;
         auto header = std::array<uint8_t, header_size>{};
         auto rc = read_bytes(header.data(), 1, &pending, deadline, cancel);
         if (rc != IoResult::ok) return fail(rc);
         rc = read_bytes(header.data() + 1, header.size() - 1, nullptr, deadline, cancel);
         if (rc != IoResult::ok) return fail(rc);
-        if (!parse_header(header.data(), header.size(), payload_cap, pending.header) ||
-            !matches(pending.header, expected.kind, expected.instance, expected.job, expected.sequence) ||
-            pending.fd_count != (pending.header.kind == Kind::error ? 0 : expected.fd_count)) return fail(IoResult::protocol);
+        if (!parse_header(header.data(), header.size(), payload_cap, pending.header)) return fail(IoResult::protocol);
+        if (expected) {
+            if (!matches(pending.header, expected->kind, expected->instance, expected->job, expected->sequence) ||
+                pending.fd_count != (pending.header.kind == Kind::error ? 0 : expected->fd_count)) return fail(IoResult::protocol);
+        } else {
+            const auto kind = pending.header.kind;
+            if (!instance || pending.header.instance != instance ||
+                (kind != Kind::prepare && kind != Kind::encode && kind != Kind::release && kind != Kind::quit) ||
+                pending.fd_count != (kind == Kind::prepare || kind == Kind::encode ? 1u : 0u)) return fail(IoResult::protocol);
+        }
         try { pending.payload.resize(pending.header.payload_size); }
         catch (const std::bad_alloc &) { return fail(IoResult::resource); }
         rc = read_bytes(pending.payload.data(), pending.payload.size(), nullptr, deadline, cancel);
@@ -81,6 +108,7 @@ public:
         return IoResult::ok;
     }
 
+public:
     // Frame owns outgoing FDs; send never transfers local ownership.
     IoResult send(const Frame & frame, uint32_t payload_cap, Clock::time_point deadline,
                   const std::atomic<bool> & cancel) {
@@ -106,10 +134,12 @@ public:
 private:
     struct Rights { const int * fds; size_t count; };
     int fd_;
+    const HealthProbe probe_;
     void close() { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
     // Any partial operation failure poisons the stream. Never resynchronize on attacker bytes.
     IoResult fail(IoResult result) { close(); return result; }
     IoResult check(Clock::time_point deadline, const std::atomic<bool> & cancel) const {
+        if (probe_.check && !probe_.check(probe_.context)) return IoResult::system;
         if (cancel.load()) return IoResult::cancelled;
         if (Clock::now() >= deadline) return IoResult::deadline;
         return fd_ < 0 ? IoResult::system : IoResult::ok;
@@ -122,8 +152,14 @@ private:
             int ms = int(std::max<int64_t>(0, std::min<int64_t>(remaining, 10)));
             pollfd p{fd_, events, 0};
             int n = ::poll(&p, 1, ms);
+            const int poll_error = errno;
+            // Observe health/cancellation/deadline after EVERY bounded poll too,
+            // including readable/error returns and EINTR. Progress cannot hide a
+            // failed engine or extend either the 10ms poll or absolute deadline.
+            rc = check(deadline, cancel);
+            if (rc != IoResult::ok) return rc;
             if (n > 0) return (p.revents & POLLNVAL) ? IoResult::system : IoResult::ok;
-            if (n < 0 && errno != EINTR) return IoResult::system;
+            if (n < 0 && poll_error != EINTR) return IoResult::system;
         }
     }
     IoResult read_bytes(uint8_t * bytes, size_t size, Frame * rights,

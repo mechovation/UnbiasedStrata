@@ -1,3 +1,8 @@
+# Model restriction
+
+- Astra is prohibited for all work on this project, including delegated agents.
+  Verify the selected model before working or delegating; never select Astra.
+
 # Deployment rules
 
 - HARD RULE: exactly one authoritative `docker-compose.yaml` and one backup,

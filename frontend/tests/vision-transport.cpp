@@ -179,6 +179,46 @@ int main(int argc, char ** argv) {
         }
         ::close(sockets[1]); assert(count_fds() == baseline);
     }
+    // An owner-only service health probe interrupts blocked reader IO even when
+    // the reader never replies and request cancellation/deadline remain unset.
+    // Probe failure poisons writes too; no partial frame can be retried.
+    for (bool writing : {false, true}) {
+        struct Observation {
+            std::thread::id owner = std::this_thread::get_id();
+            Clock::time_point fail_at = Clock::now() + 35ms;
+            unsigned calls = 0;
+            static bool check(void * context) noexcept {
+                auto & self = *static_cast<Observation *>(context);
+                assert(std::this_thread::get_id() == self.owner);
+                ++self.calls;
+                return Clock::now() < self.fail_at;
+            }
+        } observation;
+        int sockets[2]; pair(sockets);
+        {
+            Channel channel(sockets[0], {&Observation::check, &observation});
+            const auto started = Clock::now();
+            Frame out = frame(4);
+            if (writing) {
+                int small = 1024;
+                assert(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+                auto large = frame(1024 * 1024);
+                assert(channel.send(large, 1024 * 1024, Clock::now() + 2s, cancel) == IoResult::system);
+            } else {
+                // Received rights stay private and are closed when a health
+                // failure interrupts the rest of an otherwise valid header.
+                int source = ::open("/dev/null", O_RDONLY | O_CLOEXEC); assert(source >= 0);
+                auto h = encode_header(frame().header);
+                raw_send(sockets[1], h.data(), 1, &source, 1); ::close(source);
+                auto want = expected; want.fd_count = 1;
+                assert(channel.receive(out, want, cap, Clock::now() + 2s, cancel) == IoResult::system);
+                assert(out.payload == std::vector<uint8_t>(4, 42) && !out.fd_count);
+            }
+            assert(!channel.open() && !cancel && observation.calls >= 4);
+            assert(Clock::now() - started < 1s);
+        }
+        ::close(sockets[1]); assert(count_fds() == baseline);
+    }
     // Reject malformed local FD counts without out-of-bounds cleanup or closing unrelated FDs.
     {
         int sockets[2]; pair(sockets);
@@ -206,5 +246,28 @@ int main(int argc, char ** argv) {
         assert(out.payload.size() == 4); // failed receive leaves previous output untouched
     }
     assert(count_fds() == baseline);
+    // Reader command admission rejects reply kinds, stale instance, oversized
+    // declarations and wrong descriptor counts before waiting for any body.
+    for (int scenario = 0; scenario < 7; ++scenario) {
+        int sockets[2]; pair(sockets);
+        int source = ::open("/dev/null", O_RDONLY | O_CLOEXEC); assert(source >= 0);
+        {
+            Channel receiver(sockets[0]);
+            Header command{Kind::prepare, 76, 7, 11, 1};
+            if (scenario == 0) command.kind = Kind::prepared;
+            if (scenario == 1) ++command.instance;
+            if (scenario == 2) command.payload_size = cap + 1;
+            if (scenario == 4) command.kind = Kind::release;
+            if (scenario == 5) { command.kind = Kind::quit; command.job = command.sequence = 0; command.payload_size = 0; }
+            if (scenario == 6) { command.kind = Kind::release; command.payload_size = 0; }
+            auto h = encode_header(command);
+            raw_send(sockets[1], h.data(), h.size(), &source, scenario == 3 || scenario == 5 || scenario == 6 ? 0 : 1);
+            Frame out;
+            assert(receiver.receive_command(out, 7, cap, Clock::now() + 1s, cancel) ==
+                (scenario >= 5 ? IoResult::ok : IoResult::protocol));
+            if (scenario < 5) assert(!receiver.open() && out.payload.empty() && !out.fd_count);
+        }
+        ::close(source); ::close(sockets[1]); assert(count_fds() == baseline);
+    }
     std::cout << "vision transport: PASS\n";
 }

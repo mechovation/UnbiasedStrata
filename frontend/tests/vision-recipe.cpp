@@ -132,6 +132,7 @@ server_tokens single_image(strata_context_impl & ctx, const raw_buffer & bytes) 
     return server_tokens(chunks,true);
 }
 using Cache = std::map<std::string,vr::Recipe>;
+size_t native_compositions = 0;
 std::string source_id(const raw_buffer & file) { Hash h; h.add(file.data(),file.size()); return h.finish(); }
 server_tokens compose(strata_context_impl & ctx, const Rendered & r, const Cache & cache, const vr::Generation & generation) {
     server_tokens out(llama_tokens{},true);
@@ -179,6 +180,32 @@ server_tokens compose(strata_context_impl & ctx, const Rendered & r, const Cache
         special(r.prompt.substr(pos));
     }
     require(next==r.files.size(),"composition unused source");
+    if (!r.files.empty()) {
+        namespace ns = strata_frontend;
+        ns::vision_payload::Config cfg{}; cfg.width = ctx.vision_width; cfg.pixel_stride = 32;
+        cfg.vocabulary_size = llama_vocab_n_tokens(ctx.vocab);
+        ns::vision_payload::Limits caps{1024*1024,16,4096,10*1024*1024,1024*1024*1024,
+            {4096,64,8192,32768,32,1024*1024*1024}};
+        ns::vision_job_io::Prepared prepared; std::vector<std::string> ids;
+        for (const auto & file : r.files) {
+            const auto & saved = cache.at(source_id(file)); ns::vision_job::Recipe recipe; bool image = false;
+            for (const auto & part : saved.parts) {
+                if (part.kind == vr::Part::Kind::image) {
+                    require(!image,"multiple isolated image chunks"); image = true;
+                    recipe.metadata.assign(part.metadata.begin(),part.metadata.end()); ids.push_back(part.id);
+                    require(ns::vision_metadata::preflight(recipe.metadata,part.id,caps.metadata,recipe.shape),"native metadata preflight");
+                    require(ns::vision_payload::rows(recipe.shape.x,recipe.shape.y,cfg.width,caps.row_bytes,recipe.row_bytes),"native row arithmetic");
+                } else for (auto id : part.text_ids) {
+                    auto & bytes = image ? recipe.suffix_ids : recipe.prefix_ids;
+                    for (unsigned b = 0; b < 4; ++b) bytes += char(uint32_t(id) >> (8*b));
+                }
+            }
+            require(image,"missing isolated image chunk"); prepared.recipes.push_back(std::move(recipe));
+        }
+        auto native = ns::vision_composition::compose(ctx.vocab,r.prompt,r.plain,get_media_marker(),prepared,ids,cfg,caps,1024*1024,
+            [&](const std::string & text) { llama_tokens tokens; ctx.tokenize_plain(text,tokens); return tokens; });
+        vr::compare(out,native); ++native_compositions;
+    }
     return out;
 }
 struct Owner {
@@ -321,7 +348,7 @@ int main(int argc,char ** argv) {
             require(appended.serialize()==item.expected,"detached append retained borrowed storage");
         }
         std::cout<<"SPIKE_A_PASS cases="<<tested<<" rejected_invalid="<<negatives<<" detached_replays="<<detached.size()
-                 <<" isolated_replays="<<isolated_replays<<" family="<<family<<" gpu=none encode_calls="<<encode_calls<<'\n';
+                 <<" isolated_replays="<<isolated_replays<<" native_compositions="<<native_compositions<<" family="<<family<<" gpu=none encode_calls="<<encode_calls<<'\n';
         return 0;
     } catch(const std::exception & e) {std::cerr<<"SPIKE_A_FAIL "<<e.what()<<'\n'; return 1;}
 }

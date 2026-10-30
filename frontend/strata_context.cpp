@@ -8,6 +8,9 @@
 #include "literals.hpp"
 #include "picture_cache.hpp"
 #include "acquisition_request.hpp"
+#include "vision_queue.hpp"
+#include "vision_runtime.hpp"
+#include "vision_safety.hpp"
 
 #include "server-common.h"
 #include "server-task.h"
@@ -51,6 +54,8 @@ constexpr int ENGINE_CONTEXT_RESERVE = 8;
 struct Slot {
     std::unique_ptr<server_task> task;
 
+    bool native = false;
+    std::shared_ptr<const server_tokens> native_tokens; // owned async composition, never an empty-token launch
     bool started    = false; // GEN written
     bool cancelled  = false; // the client went away: STOP sent, output is drained, no final result
     bool stop_sent  = false; // STOP sent for our own reason (stop string, limit); the final result is still sent
@@ -109,9 +114,38 @@ struct Slot {
     }
 };
 
+// Admission before JSON/acquisition copies; charges follow streaming response
+// ownership too. HTTP socket/body allocations are additionally cgroup-contained.
+struct HttpBudget : std::enable_shared_from_this<HttpBudget> {
+    std::mutex mutex;
+    size_t count = 0, bytes = 0, max_count, max_bytes;
+    struct Charge {
+        std::shared_ptr<HttpBudget> budget; size_t bytes;
+        ~Charge() { std::lock_guard<std::mutex> lock(budget->mutex); --budget->count; budget->bytes -= bytes; }
+    };
+    HttpBudget(size_t count, size_t bytes) : max_count(count), max_bytes(bytes) {}
+    std::shared_ptr<Charge> reserve(size_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (count == max_count || size > max_bytes - bytes) return {};
+        auto charge = std::make_shared<Charge>(); charge->budget = shared_from_this(); charge->bytes = size;
+        ++count; bytes += size; return charge;
+    }
+};
 // mirrors server_res_generator in server-context.cpp
 struct res_generator : server_res_spipe {
     server_response_reader rd;
+    std::shared_ptr<HttpBudget::Charge> http_charge;
+    std::shared_ptr<strata_frontend::vision_control::Request> request_control;
+    ~res_generator() override {
+        if (request_control) request_control->cancel(strata_frontend::vision_control::Reason::disconnect);
+    }
+    bool observe_stop(bool disconnected) {
+        if (request_control) {
+            request_control->observe();
+            if (disconnected) request_control->cancel(strata_frontend::vision_control::Reason::disconnect);
+        }
+        return disconnected; // deadline produces a classified result, not a closed connection
+    }
     res_generator(server_queue & queue_tasks, server_response & queue_results)
             : rd(queue_tasks, queue_results, /* polling_interval_seconds */ 1) {}
     void ok(const json & response_data) {
@@ -196,7 +230,8 @@ struct strata_context_impl {
     std::string model_name;
     std::string model_path;
 
-    server_queue    queue_tasks;
+    std::shared_ptr<server_queue> queue_owner = std::make_shared<server_queue>();
+    server_queue & queue_tasks = *queue_owner; // wake sinks retain the actual queue
     server_response queue_results;
 
     Engine                   engine;
@@ -207,6 +242,18 @@ struct strata_context_impl {
     std::atomic<bool>        engine_dead{false};
 
     Slot slot;
+    // Explicit profile-selected candidate; legacy remains the default until GPU acceptance.
+    // Join before destroying vocabulary or the queue callback owner.
+    std::unique_ptr<strata_frontend::vision_queue::Bridge> native_vision;
+    std::string native_profile, native_guard, native_reader;
+    std::atomic<bool> native_busy{false};
+    std::shared_ptr<HttpBudget> native_http;
+    std::shared_ptr<HttpBudget::Charge> admit_http(const server_http_req & req) {
+        return native_http ? native_http->reserve(req.body.size()) : nullptr;
+    }
+    error_type http_refusal(const server_http_req & req) const {
+        return native_http && req.body.size() > native_http->max_bytes ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_UNAVAILABLE;
+    }
 
     // ---- queue callbacks -------------------------------------------------------------------------------------------
 
@@ -222,7 +269,65 @@ struct strata_context_impl {
     }
 
     void send_error(const server_task & task, const std::string & error, enum error_type type) {
-        send_error(task.id, error, type, task.n_tokens());
+        send_error(task.id, error, type, prompt_count(task));
+    }
+    int32_t prompt_count(const server_task & task) const {
+        return slot.native && slot.task && task.id == slot.task->id && slot.native_tokens ?
+            int32_t(slot.native_tokens->size()) : task.n_tokens();
+    }
+    void native_error(int id, strata_frontend::vision_queue::Error error) {
+        using E = strata_frontend::vision_queue::Error;
+        if (error == E::context && slot.task) {
+            send_error(*slot.task, "the request exceeds the available context size", ERROR_TYPE_EXCEED_CONTEXT_SIZE); return;
+        }
+        if (error == E::deadline) {
+            struct DeadlineError final : server_task_result_error {
+                json to_json() override { auto value = server_task_result_error::to_json(); value["code"] = 504; return value; }
+            };
+            auto result = std::make_unique<DeadlineError>(); result->id = id; result->err_msg = "vision request deadline exceeded";
+            queue_results.send(std::move(result)); return;
+        }
+        send_error(id, error == E::unavailable ? "vision reader unavailable" : error == E::resource ? "vision resource limit exceeded" :
+            error == E::invalid ? "invalid or unsupported image" : "vision request failed",
+            error == E::unavailable ? ERROR_TYPE_UNAVAILABLE : error == E::resource || error == E::invalid ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER);
+    }
+    void stop_generation() {
+        if (slot.native) native_vision->stop_generation();
+        else engine.stop();
+    }
+    void drain_native() {
+        using N = strata_frontend::vision_queue::Bridge::Notice;
+        while (auto notice = native_vision->poll()) {
+            if (!slot.native || !slot.active() || notice->identity.task != uint64_t(slot.task->id) + 1) continue;
+            if (notice->kind == N::prompt) {
+                slot.native_tokens = std::shared_ptr<const server_tokens>(notice->composed, &notice->composed->tokens);
+                const auto room = slot.native_tokens->empty() ? int64_t(0) : n_ctx - int64_t(slot.native_tokens->size()) - ENGINE_CONTEXT_RESERVE;
+                slot.n_predict = slot.task->params.n_predict;
+                if (room > 0 && (slot.n_predict < 0 || slot.n_predict > room)) slot.n_predict = int32_t(room);
+                native_vision->admit(slot.n_predict, room > 0 ? gen_header(*slot.task, slot.n_predict) : std::string(), room > 0);
+            } else if (notice->kind == N::line) {
+                if (!slot.started) {
+                    slot.started = true; slot.stats.update_prompt_start();
+                    if (slot.task->params.stream && !slot.cancelled) send_partial_response({}, false, true);
+                }
+                handle_line(notice->output);
+            } else {
+                // Certified handback/RELEASE/teardown AND bounded output drain.
+                if (slot.cancelled || notice->disconnected) finish_slot();
+                else if (notice->error != strata_frontend::vision_queue::Error::none) {
+                    native_error(slot.task->id, notice->error); finish_slot();
+                } else if (notice->output.kind == EngineLine::DONE) {
+                    if (!slot.started) {
+                        slot.started = true; slot.stats.update_prompt_start();
+                        if (slot.task->params.stream) send_partial_response({}, false, true);
+                    }
+                    on_done(notice->output);
+                } else { native_error(slot.task->id, strata_frontend::vision_queue::Error::internal); finish_slot(); }
+            }
+        }
+        // Pinned server_response::terminate() aborts HTTP threads still waking
+        // for already-published results. Keep it alive through HTTP owner join.
+        if (native_vision->settled()) queue_tasks.terminate();
     }
 
     // mirrors process_single_task in server-context.cpp, for the task types this front end has
@@ -234,10 +339,16 @@ struct strata_context_impl {
                     queue_tasks.defer(std::move(task));
                     return true;
                 }
-                launch(std::move(task));
+                if (native_vision) {
+                    slot.task = std::make_unique<server_task>(std::move(task)); slot.native = true; native_busy = true;
+                    if (!native_vision->begin(slot.task->id)) {
+                        native_error(slot.task->id, strata_frontend::vision_queue::Error::unavailable); finish_slot();
+                    }
+                } else launch(std::move(task));
                 return true;
 
             case SERVER_TASK_TYPE_CANCEL:
+                if (native_vision) native_vision->cancel(task.id_target);
                 if (slot.active() && slot.task->id == task.id_target) {
                     cancel_current();
                 }
@@ -264,6 +375,7 @@ struct strata_context_impl {
 
     // mirrors update_slots in server-context.cpp: called by the queue after each round of tasks
     void update_slots() {
+        if (native_vision) { drain_native(); return; } // MUST drain before idle return
         if (!slot.active()) {
             return;
         }
@@ -687,6 +799,7 @@ struct strata_context_impl {
         }
         SRV_INF("task %d: cancelled by the client, stopping the engine's request\n", slot.task->id);
         slot.cancelled = true;
+        if (slot.native) { native_vision->cancel(slot.task->id); return; }
         if (!engine.stop()) {
             // the engine is gone; the supervisor will report it
             finish_slot();
@@ -811,7 +924,7 @@ struct strata_context_impl {
         // a stop the engine does not know about (stop string, our limit): tell it, keep draining to its DONE
         if (!slot.has_next_token && slot.stop != STOP_TYPE_EOS && !slot.stop_sent) {
             slot.stop_sent = true;
-            engine.stop();
+            stop_generation();
         }
     }
 
@@ -824,9 +937,9 @@ struct strata_context_impl {
         SRV_INF("task %d: DONE produced=%lld prompt=%lld prompt_ms=%.1f decode_ms=%.1f finish=%s drafts=%lld/%lld reused=%lld\n",
                 t.id, d.produced, d.prompt_n, d.prompt_ms, d.decode_ms, d.finish.c_str(), d.draft_accepted, d.draft_offered, d.reused);
 
-        if (d.prompt_n != (long long) t.n_tokens()) {
+        if (d.prompt_n != (long long) prompt_count(t)) {
             // the engine answered for another prompt: never pass that off as this request's reply
-            SRV_ERR("task %d: engine prompt size mismatch: sent %d, engine reports %lld; refusing the response\n", t.id, t.n_tokens(), d.prompt_n);
+            SRV_ERR("task %d: engine prompt size mismatch: sent %d, engine reports %lld; refusing the response\n", t.id, prompt_count(t), d.prompt_n);
             if (!slot.cancelled) {
                 send_error(t, "engine response prompt size mismatch", ERROR_TYPE_SERVER);
             }
@@ -870,7 +983,7 @@ struct strata_context_impl {
         if (!slot.active()) {
             return;
         }
-        slot.release();
+        slot.release(); native_busy = false;
         // Return capacity exactly once. Promotion only enqueues: launch failures must not recurse.
         queue_tasks.pop_deferred_task(-1);
     }
@@ -885,7 +998,7 @@ struct strata_context_impl {
 
         if (is_progress) {
             res->is_progress        = true;
-            res->progress.total     = t.n_tokens();
+            res->progress.total     = prompt_count(t);
             res->progress.cache     = (int32_t) slot.stats.n_prompt_cached;
             res->progress.processed = (int32_t) pp_done;
             res->progress.time_ms   = slot.stats.t_elapsed_us() / 1000;
@@ -898,7 +1011,7 @@ struct strata_context_impl {
         }
 
         res->n_decoded             = (int32_t) slot.stats.n_gen;
-        res->n_prompt_tokens       = t.n_tokens();
+        res->n_prompt_tokens       = prompt_count(t);
         res->n_prompt_tokens_cache = (int32_t) slot.stats.n_prompt_cached;
         res->post_sampling_probs   = t.params.post_sampling_probs;
 
@@ -930,14 +1043,14 @@ struct strata_context_impl {
             res->tokens  = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
-        res->prompt          = tokens_to_str(vocab, t.tokens.get_text_tokens());
+        res->prompt          = tokens_to_str(vocab, (slot.native_tokens ? *slot.native_tokens : t.tokens).get_text_tokens());
         res->response_fields = std::move(t.params.response_fields);
 
         res->truncated             = slot.truncated;
         res->n_decoded             = (int32_t) slot.stats.n_gen;
-        res->n_prompt_tokens       = t.n_tokens();
+        res->n_prompt_tokens       = prompt_count(t);
         res->n_prompt_tokens_cache = (int32_t) slot.stats.n_prompt_cached;
-        res->n_tokens_cached       = t.n_tokens() + (int32_t) slot.stats.n_gen;
+        res->n_tokens_cached       = prompt_count(t) + (int32_t) slot.stats.n_gen;
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
@@ -1024,7 +1137,8 @@ struct strata_context_impl {
     // Text inside a plain span, tokenized as text. parse_special=false keeps the control tokens as text; an added
     // token the tokenizer matches regardless (USER_DEFINED: <think>, <tool_call> in Qwen's vocabulary) is split in
     // two and each half tokenized again, until no piece is one. A one-character added token is that character.
-    void tokenize_plain(const std::string & text, llama_tokens & out) const {
+    void tokenize_plain(const std::string & text, llama_tokens & out) const { tokenize_plain(vocab, text, out); }
+    static void tokenize_plain(const llama_vocab * vocab, const std::string & text, llama_tokens & out) {
         for (llama_token t : common_tokenize(vocab, text, false, false)) {
             const llama_token_attr attr = llama_vocab_get_attr(vocab, t);
             if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
@@ -1037,8 +1151,8 @@ struct strata_context_impl {
                 out.push_back(t);
                 continue;
             }
-            tokenize_plain(piece.substr(0, cut), out);
-            tokenize_plain(piece.substr(cut), out);
+            tokenize_plain(vocab, piece.substr(0, cut), out);
+            tokenize_plain(vocab, piece.substr(cut), out);
         }
     }
 
@@ -1111,25 +1225,30 @@ struct strata_context_impl {
         res->set_req(&req);
 
         int32_t sse_ping_interval = params.sse_ping_interval;
+        int native_registered = -1;
 
         try {
             const auto & prompt = data.at("prompt");
 
+            const bool native_request = bool(native_vision);
+            const bool native_media = native_request && !files.empty();
             std::vector<server_tokens> inputs;
-            if (!plain.empty() && prompt.is_string()) {
+            if (native_media) {
+                if (!prompt.is_string()) throw std::invalid_argument("vision requires a string prompt");
+            } else if (!plain.empty() && prompt.is_string()) {
                 inputs.push_back(tokenize_prompt(prompt.get<std::string>(), plain, files));
             } else if (res_type != TASK_RESPONSE_TYPE_NONE && mctx != nullptr) {
                 inputs.push_back(process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt));
             } else {
                 inputs = tokenize_input_prompts(vocab, mctx, prompt, true, true, init_opt);
             }
-            if (inputs.size() != 1) {
+            if (!native_media && inputs.size() != 1) {
                 throw std::invalid_argument("this server takes one prompt per request");
             }
 
             server_task task = server_task(SERVER_TASK_TYPE_COMPLETION);
             task.id     = rd.get_new_id();
-            task.tokens = std::move(inputs[0]);
+            if (!native_media) task.tokens = std::move(inputs[0]);
             task.params = server_schema::eval_llama_cmpl_schema(vocab, params, logit_bias_eog, data);
             if (task.params.n_cmpl > 1) {
                 throw std::invalid_argument("n > 1 is not supported by this server");
@@ -1140,10 +1259,22 @@ struct strata_context_impl {
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = model_name;
 
+            if (native_request) {
+                strata_frontend::vision_queue::Error rejection = strata_frontend::vision_queue::Error::unavailable;
+                res->request_control = native_vision->enqueue(task.id, native_media ? prompt.get<std::string>() : std::string(),
+                    native_media ? plain : std::vector<std::pair<size_t, size_t>>{}, files,
+                    native_media ? llama_tokens{} : task.tokens.get_text_tokens(), &rejection);
+                if (!res->request_control) {
+                    res->error(format_error_response("native request admission/resource limit exceeded",
+                        rejection == strata_frontend::vision_queue::Error::unavailable ? ERROR_TYPE_UNAVAILABLE : ERROR_TYPE_INVALID_REQUEST)); return res;
+                }
+                native_registered = task.id;
+            }
             std::vector<server_task> tasks;
             tasks.push_back(std::move(task));
-            rd.post_tasks(std::move(tasks));
+            rd.post_tasks(std::move(tasks)); native_registered = -1;
         } catch (const std::exception & e) {
+            if (native_registered >= 0) native_vision->withdraw(native_registered);
             res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -1151,7 +1282,7 @@ struct strata_context_impl {
         const bool stream = json_value(data, "stream", false);
 
         if (!stream) {
-            auto all_results = rd.wait_for_all(req.should_stop);
+            auto all_results = rd.wait_for_all([&] { return res->observe_stop(req.should_stop()); });
             if (all_results.is_terminated) {
                 return res; // connection closed
             } else if (all_results.error) {
@@ -1166,7 +1297,7 @@ struct strata_context_impl {
         }
 
         // streaming: the first error is a plain (non-stream) error response, as OpenAI does
-        auto first_result = rd.next(req.should_stop);
+        auto first_result = rd.next([&] { return res->observe_stop(req.should_stop()); });
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());
             return res;
@@ -1199,7 +1330,7 @@ struct strata_context_impl {
                 }
                 return format_oai_sse(json {{ "error", res_json }});
             };
-            auto effective_should_stop = [&res_this]() { return res_this->should_stop(); };
+            auto effective_should_stop = [&res_this]() { return res_this->observe_stop(res_this->should_stop()); };
 
             try {
                 if (effective_should_stop()) {
@@ -1274,10 +1405,21 @@ struct strata_context_impl {
 // ---- strata_context -------------------------------------------------------------------------------------------------
 
 strata_context::strata_context() : impl(std::make_unique<strata_context_impl>()) {}
-strata_context::~strata_context() = default;
+strata_context::~strata_context() {
+    if (impl->native_vision) { impl->native_vision->request_shutdown(); impl->native_vision->join(); }
+    impl->engine.quit();
+    if (impl->mctx) { mtmd_free(impl->mctx); impl->mctx = nullptr; }
+    if (impl->model) { llama_model_free(impl->model); impl->model = nullptr; }
+}
+
+void strata_context::configure_native(const std::string & profile, const std::string & guard, const std::string & reader) {
+    if (impl->native_vision || impl->engine.alive() || impl->model) throw std::logic_error("native configuration after startup");
+    impl->native_profile = profile; impl->native_guard = guard; impl->native_reader = reader;
+}
 
 bool strata_context::start_engine(const common_params & params, const std::string & engine_exe,
                                   const std::vector<std::string> & engine_args, std::string & err) {
+    if (impl->native_vision) { err = "native pipeline owns engine launch; legacy fork is forbidden"; return false; }
     impl->params      = params;
     impl->engine_exe  = engine_exe;
     impl->engine_args = engine_args;
@@ -1289,6 +1431,12 @@ bool strata_context::start_engine(const common_params & params, const std::strin
     for (const auto & a : engine_args) {
         argv.push_back(a);
     }
+    if (!impl->native_profile.empty()) {
+        if (params.mmproj.path.empty() || impl->native_guard.empty() || impl->native_reader.empty()) {
+            err = "native vision requires a projector and companion executables"; return false;
+        }
+        return true; // spawn belongs to the persistent owner, after reader READY
+    }
     return impl->engine.start(engine_exe, argv, err);
 }
 
@@ -1298,6 +1446,7 @@ void strata_context::set_picture_cache(size_t entries, size_t bytes) {
 
 bool strata_context::load(common_params & params, std::string & err) {
     auto & I = *impl;
+    if (I.native_vision) { err = "native startup configuration is not release-qualified"; return false; }
     I.params = params;
 
     // the vocabulary and the chat template, from the GGUF's metadata; no tensor is read
@@ -1326,10 +1475,42 @@ bool strata_context::load(common_params & params, std::string & err) {
     I.model_path = params.model.path;
     I.model_name = params.model_alias.empty() ? file_stem(params.model.path) : *params.model_alias.begin();
 
-    if (!params.mmproj.path.empty()) {
-        if (!I.init_vision(params, err)) {
-            return false;
-        }
+    if (!I.native_profile.empty()) {
+        try {
+            namespace vr = strata_frontend::vision_runtime;
+            namespace vq = strata_frontend::vision_queue;
+            namespace vs = strata_frontend::vision_supervisor;
+            namespace ea = strata_frontend::vision_engine_adapter;
+            if (params.image_max_tokens <= 0 || params.cpuparams.n_threads <= 0) throw std::runtime_error("explicit native image/thread limits required");
+            const auto runtime = vr::Runtime::load(I.native_profile, params.model.path, params.mmproj.path, I.engine_exe,
+                I.engine_args, uint32_t(params.image_max_tokens), uint32_t(params.cpuparams.n_threads), params.mmproj_use_gpu);
+            const auto pad = common_tokenize(I.vocab, "<|image_pad|>", false, true);
+            I.image_pad_id = pad.size() == 1 ? pad[0] : -1;
+            runtime.apply_parent_rlimits();
+            if (I.image_pad_id < 0 || uint32_t(I.image_pad_id) >= runtime.config.vocabulary_size) throw std::runtime_error("unsupported native vocabulary");
+            I.vision_width = int32_t(runtime.config.width); I.p_mmproj_gpu = runtime.gpu;
+            I.native_http = std::make_shared<HttpBudget>(runtime.queue_limits.pending_count,runtime.queue_limits.pending_bytes);
+            auto artifacts = std::make_shared<strata_frontend::vision_artifact::Budget>(strata_frontend::vision_artifact::Usage{runtime.artifact_bytes,runtime.artifact_fds});
+            auto recipes = std::make_shared<strata_frontend::vision_job_io::RecipeBudget>(strata_frontend::vision_job_io::RecipeBudget::Usage{runtime.recipe_bytes,runtime.recipe_snapshots});
+            vs::Launch reader{I.native_guard,I.native_reader,{I.native_reader},runtime.reader_environment,1,runtime.config,runtime.wire_limits,true};
+            std::vector<std::string> args{runtime.engine_executable,"--serve"}; args.insert(args.end(),I.engine_args.begin(),I.engine_args.end());
+            ea::Launch engine{I.native_guard,runtime.engine_executable,std::move(args),runtime.engine_environment};
+            strata_frontend::clean_process_detail::Fd diagnostic; diagnostic.value = ::open("/dev/null",O_WRONLY|O_CLOEXEC);
+            if (diagnostic.value < 0) throw std::runtime_error("native diagnostic containment unavailable");
+            I.native_vision = std::make_unique<vq::Bridge>(I.queue_owner,std::move(reader),runtime.lifecycle,std::move(engine),runtime.engine_limits,
+                runtime.queue_limits,diagnostic.value,I.vocab,I.image_pad_id,get_media_marker(),[vocab=I.vocab](const std::string & text) {
+                    llama_tokens ids; strata_context_impl::tokenize_plain(vocab,text,ids); return ids;
+                },artifacts,recipes,[gpu=runtime.gpu](std::shared_ptr<ea::Adapter> adapter) {
+                    return std::make_shared<strata_frontend::vision_safety::Exclusive>(std::move(adapter),gpu);
+                });
+            if (!I.native_vision->set_cache(I.pictures.max_entries(),I.pictures.max_bytes()) ||
+                !I.native_vision->wait_ready(strata_frontend::vision_job_io::after(runtime.lifecycle.ready))) {
+                err = "native reader/engine startup failed or timed out"; return false;
+            }
+            I.n_ctx = int64_t(std::min<uint64_t>(I.native_vision->context(),runtime.queue_limits.prompt_cells));
+        } catch (...) { err = "native vision configuration/startup failed"; return false; }
+    } else if (!params.mmproj.path.empty()) {
+        if (!I.init_vision(params, err)) return false;
     }
 
     // mirrors the chat template setup in server_context_impl::load_model
@@ -1353,7 +1534,7 @@ bool strata_context::load(common_params & params, std::string & err) {
             /* reasoning_format      */ params.reasoning_format,
             /* chat_template_kwargs  */ params.default_template_kwargs,
             /* tmpls                 */ std::move(chat_templates),
-            /* allow_image           */ I.mctx != nullptr,
+            /* allow_image           */ I.mctx != nullptr || bool(I.native_vision),
             /* allow_audio           */ false,
             /* allow_video           */ false,
             /* enable_thinking       */ enable_thinking,
@@ -1368,16 +1549,16 @@ bool strata_context::load(common_params & params, std::string & err) {
     // the engine: READY carries the context it allocated
     LOG_INF("waiting for the engine (%s) to load\n", I.engine_exe.c_str());
     std::string eerr;
-    if (!I.engine.wait_ready(eerr, /* timeout_s */ 3600)) {
+    if (!I.native_vision && !I.engine.wait_ready(eerr, /* timeout_s */ 3600)) {
         err = "engine: " + eerr;
         return false;
     }
-    I.n_ctx = I.engine.max_context() > 0 ? I.engine.max_context() : params.n_ctx;
+    if (!I.native_vision) I.n_ctx = I.engine.max_context() > 0 ? I.engine.max_context() : params.n_ctx;
     if (I.n_ctx <= 0) {
         err = "the engine did not report its context size and -c was not given";
         return false;
     }
-    if (!I.engine.can_stop()) {
+    if (!I.native_vision && !I.engine.can_stop()) {
         LOG_WRN("%s", "the engine does not honour STOP: a cancelled request runs to its end\n");
     }
     for (const auto & kv : I.engine.info()) {
@@ -1397,9 +1578,11 @@ bool strata_context::load(common_params & params, std::string & err) {
 
 void strata_context::start_loop() {
     impl->queue_tasks.start_loop();
+    if (impl->native_vision) impl->native_vision->join();
 }
 
 void strata_context::terminate() {
+    if (impl->native_vision) { impl->native_vision->request_shutdown(); return; }
     impl->queue_tasks.terminate();
     impl->queue_results.terminate();
     impl->engine.quit();
@@ -1410,6 +1593,10 @@ void strata_context::terminate() {
 }
 
 bool strata_context::engine_exited(std::string & why) {
+    if (impl->native_vision) {
+        if (!impl->native_vision->service_failed()) return false;
+        why = "native engine failure"; return true;
+    }
     if (impl->engine_dead) {
         why = "the engine closed its output";
         return true;
@@ -1418,7 +1605,7 @@ bool strata_context::engine_exited(std::string & why) {
 }
 
 bool strata_context::engine_alive() const {
-    return impl->engine.alive() && !impl->engine_dead;
+    return impl->native_vision ? impl->native_vision->service_alive() : impl->engine.alive() && !impl->engine_dead;
 }
 
 long long strata_context::n_ctx() const {
@@ -1430,13 +1617,13 @@ void strata_context::init_routes(server_http_context & http) {
 
     auto get_health = [I](const server_http_req &) {
         auto res = I->create_response();
-        if (!I->engine.alive() || I->engine_dead) {
+        if (I->native_vision ? !I->native_vision->service_alive() : (!I->engine.alive() || I->engine_dead)) {
             res->error(format_error_response("the engine is not running", ERROR_TYPE_UNAVAILABLE));
             return res;
         }
         // llama.cpp's shape ("status") plus the fields upstream PolyStrata clients (tools/strata_bench.py,
         // its is_strata / wait_ready) look for: "service" and "loaded". The engine only serves once loaded.
-        res->ok({{"status", "ok"}, {"busy", I->slot.active()},
+        res->ok({{"status", "ok"}, {"busy", I->native_vision ? I->native_busy.load() : I->slot.active()},
                  {"service", "strata"}, {"loaded", true},
                  {"model", I->model_name}, {"max_context", I->n_ctx}});
         return res;
@@ -1467,6 +1654,8 @@ void strata_context::init_routes(server_http_context & http) {
             {"chat_template_caps", caps},
             {"build_info", std::string(llama_build_info())},
             {"engine", I->engine_is_poly ? "strata-poly" : "strata"},
+            {"vision_status", I->native_vision ? (I->native_vision->available() ? "available" : "unavailable") : (I->mctx ? "available" : "unconfigured")},
+            {"vision_configured", I->chat_params.allow_image},
         });
         return res;
     };
@@ -1495,12 +1684,15 @@ void strata_context::init_routes(server_http_context & http) {
     };
 
     auto post_chat_completions = [I, parse_chat](const server_http_req & req) {
+        auto charge = I->admit_http(req);
+        if (I->native_http && !charge) { auto res = I->create_response(); res->error(format_error_response("native HTTP admission limit exceeded",I->http_refusal(req))); return res; }
         std::vector<raw_buffer> files;
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
         try {
             json body_parsed = parse_chat(body, files, plain, req.should_stop);
-            return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
+            auto res = I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
+            res->http_charge = std::move(charge); return res;
         } catch (const strata_acquisition::Error & e) {
             auto res = I->create_response();
             auto error = format_error_response(e.what(), e.status < 500 ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER);
@@ -1512,19 +1704,25 @@ void strata_context::init_routes(server_http_context & http) {
     };
 
     auto post_completions_oai = [I](const server_http_req & req) {
+        auto charge = I->admit_http(req);
+        if (I->native_http && !charge) { auto res = I->create_response(); res->error(format_error_response("native HTTP admission limit exceeded",I->http_refusal(req))); return res; }
         std::vector<raw_buffer> files;
         const json body = json::parse(req.body);
-        return I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_OAI_CMPL);
+        auto res = I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_OAI_CMPL); res->http_charge = std::move(charge); return res;
     };
 
     auto post_completions = [I](const server_http_req & req) {
+        auto charge = I->admit_http(req);
+        if (I->native_http && !charge) { auto res = I->create_response(); res->error(format_error_response("native HTTP admission limit exceeded",I->http_refusal(req))); return res; }
         std::vector<raw_buffer> files;
         const json body = json::parse(req.body);
-        return I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_NONE);
+        auto res = I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_NONE); res->http_charge = std::move(charge); return res;
     };
 
     auto post_apply_template = [I, parse_chat](const server_http_req & req) {
         auto res = I->create_response();
+        auto charge = I->admit_http(req);
+        if (I->native_http && !charge) { res->error(format_error_response("native HTTP admission limit exceeded",I->http_refusal(req))); return res; }
         std::vector<raw_buffer> files;
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
@@ -1596,4 +1794,10 @@ void strata_context::init_routes(server_http_context & http) {
     http.post("/tokenize",            ex_wrapper(post_tokenize));
     http.post("/detokenize",          ex_wrapper(post_detokenize));
     http.post("/apply-template",      ex_wrapper(post_apply_template));
+    http.post("/vision/recover", ex_wrapper([I](const server_http_req &) {
+        auto res = I->create_response();
+        if (!I->native_vision || !I->native_vision->recover()) res->error(format_error_response("vision recovery unavailable or busy", ERROR_TYPE_UNAVAILABLE));
+        else res->ok({{"status","starting"}});
+        return res;
+    }));
 }

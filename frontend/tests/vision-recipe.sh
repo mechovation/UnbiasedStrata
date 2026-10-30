@@ -20,7 +20,9 @@ grep -Fxq "CMAKE_HOME_DIRECTORY:INTERNAL=$ROOT" "$BUILD/CMakeCache.txt" || {
 }
 # A source label alone does not prove stale archives implement that pin. Rebuild
 # all linked libraries from this checkout, then record their content fingerprints.
-cmake --build "$BUILD" --target strata_llama_server --clean-first -j "${SPIKE_JOBS:-4}"
+if [[ ${PR4_REUSE_BUILD:-0} != 1 ]]; then
+    cmake --build "$BUILD" --target strata_llama_server --clean-first -j "${SPIKE_JOBS:-4}"
+fi
 printf 'SPIKE_SOURCE_PIN %s\n' "$PIN"
 sha256sum "$BUILD/libstrata_llama_server.a" "$BUILD/llama.cpp/tools/mtmd/libmtmd.a" \
     "$BUILD/llama.cpp/src/libllama.a" "$BUILD/llama.cpp/common/libllama-common.a"

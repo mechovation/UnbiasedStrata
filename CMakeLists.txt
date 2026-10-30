@@ -2265,8 +2265,18 @@ if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
 
   add_executable(unbiased-strata frontend/main.cpp frontend/strata_context.cpp)
   target_include_directories(unbiased-strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
-  target_link_libraries(unbiased-strata PRIVATE strata_llama_server)
+  target_link_libraries(unbiased-strata PRIVATE strata_llama_server OpenSSL::Crypto ${CMAKE_DL_LIBS})
   target_compile_features(unbiased-strata PRIVATE cxx_std_20)
+  target_compile_definitions(unbiased-strata PRIVATE _GNU_SOURCE)
+
+  add_executable(strata-process-guard frontend/process_guard.cpp)
+  target_compile_features(strata-process-guard PRIVATE cxx_std_17)
+  add_executable(strata-vision-reader frontend/vision_reader_main.cpp frontend/vision_reader.cpp)
+  target_include_directories(strata-vision-reader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
+  target_link_libraries(strata-vision-reader PRIVATE strata_llama_server OpenSSL::Crypto ${CMAKE_DL_LIBS})
+  target_compile_features(strata-vision-reader PRIVATE cxx_std_20)
+  target_compile_definitions(strata-vision-reader PRIVATE _GNU_SOURCE)
+  add_dependencies(unbiased-strata strata-process-guard strata-vision-reader)
 
   # The engine adapter against the fake engine (frontend/tests/fake-engine.py): no GPU, no model, no llama.cpp.
   # `make test` builds and runs it, then frontend/tests/e2e.sh against the binary above.

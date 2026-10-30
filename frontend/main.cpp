@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,17 +32,10 @@
 
 namespace {
 
-std::function<void(int)> shutdown_handler;
-std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
-
+volatile sig_atomic_t shutdown_signal = 0;
 void signal_handler(int signal) {
-    if (is_terminating.test_and_set()) {
-        std::fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        std::exit(1);
-    }
-    if (shutdown_handler) {
-        shutdown_handler(signal);
-    }
+    if (shutdown_signal) ::_exit(1);
+    shutdown_signal = signal; // no locks, allocation, or native IO in a signal handler
 }
 
 void usage() {
@@ -56,6 +50,8 @@ void usage() {
         "                         handed to the engine (Qwen family); on the CPU (--threads N) unless --mmproj-gpu\n"
         "  --mmproj-gpu           encode on the card: about 1 GB of VRAM plus work buffers, taken before the engine\n"
         "                         sizes its expert cache only if the encoder loads first; for cards with room\n"
+        "  --native-vision FILE   opt-in supervised reader/engine candidate; explicit JSON resource profile required\n"
+        "                         requires --mmproj, --image-max-tokens and companion reader/guard executables\n"
         "  --picture-cache N      keep the encoded rows of the last N pictures (default 64, up to 1 GiB) so a chat\n"
         "                         that resends its pictures every turn encodes each once; 0 turns it off\n"
         "  --                     everything after it is passed to the engine; --serve is added\n"
@@ -90,7 +86,7 @@ int main(int argc, char ** argv) {
 #endif
 
     // split: ours (--engine), llama-server's, and after `--` the engine's
-    std::string engine_exe;
+    std::string engine_exe, native_profile;
     std::vector<std::string> engine_args;
     std::vector<char *> llama_argv;
     bool mmproj_gpu = false; // the vision encoder on the card: only where the engine leaves room (a 48 GB card)
@@ -112,6 +108,10 @@ int main(int argc, char ** argv) {
         if (a.rfind("--engine=", 0) == 0) {
             engine_exe = a.substr(9);
             continue;
+        }
+        if (a == "--native-vision") {
+            if (i + 1 >= argc) { usage(); return 2; }
+            native_profile = argv[++i]; continue;
         }
         if (a == "--mmproj-gpu") {
             mmproj_gpu = true;
@@ -140,6 +140,16 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    // Argument registration also enumerates backends, so mask before parsing,
+    // not just before llama_backend_init(). The parent never owns GPU work.
+    if (!native_profile.empty()) {
+        if (::setenv("CUDA_VISIBLE_DEVICES","-1",1) || ::setenv("CUDA_DEVICE_ORDER","PCI_BUS_ID",1)) return 2;
+        // Expired/denied safety proof requires immediate whole-service fail-stop.
+        // Do not invoke ggml's terminate hook: it may fork a debugger, retain
+        // unbounded diagnostics or fault while trying to print a backtrace.
+        std::set_terminate([] { std::_Exit(70); });
+    }
+
     common_params params;
     common_init();
     server_stream_session_manager_start();
@@ -159,10 +169,25 @@ int main(int argc, char ** argv) {
         params.model_alias.insert(model_name);
     }
 
+    if (!native_profile.empty()) {
+        if (params.n_threads_http < 1) {
+            std::fprintf(stderr,"unbiased-strata: native mode requires an explicit --threads-http limit\n"); return 2;
+        }
+        // Only supervised children receive the approved GPU UUID through their
+        // independently constructed runtime environments; keep the parent masked.
+    }
     llama_backend_init();
+    struct BackendGuard { ~BackendGuard() { llama_backend_free(); } } backend_guard;
     llama_numa_init(params.numa);
 
     strata_context ctx_server;
+    if (!native_profile.empty()) {
+        const auto guard = self_dir() + "/strata-process-guard", reader = self_dir() + "/strata-vision-reader";
+        if (!file_exists(guard) || !file_exists(reader)) {
+            std::fprintf(stderr,"unbiased-strata: native companion executables are missing\n"); return 2;
+        }
+        ctx_server.configure_native(native_profile,guard,reader);
+    }
     ctx_server.set_picture_cache((size_t) picture_cache, (size_t) 1 << 30);
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
@@ -185,7 +210,6 @@ int main(int argc, char ** argv) {
         server_stream_session_manager_stop();
         ctx_http.stop();
         ctx_server.terminate();
-        llama_backend_free();
     };
 
     if (!ctx_http.start()) {
@@ -205,9 +229,6 @@ int main(int argc, char ** argv) {
     ctx_http.is_ready.store(true);
     SRV_INF("listening on %s, context %lld tokens\n", ctx_http.listening_address.c_str(), ctx_server.n_ctx());
 
-    shutdown_handler = [&](int) {
-        ctx_server.terminate();
-    };
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
     sigemptyset(&sigint_action.sa_mask);
@@ -222,6 +243,7 @@ int main(int argc, char ** argv) {
     std::thread supervisor([&]() {
         std::string why;
         while (!stop_supervisor) {
+            if (shutdown_signal) { ctx_server.terminate(); return; }
             if (ctx_server.engine_exited(why)) {
                 SRV_ERR("%s; shutting down so the service manager can restart\n", why.c_str());
                 engine_died = true;
@@ -236,6 +258,7 @@ int main(int argc, char ** argv) {
 
     stop_supervisor = true;
     supervisor.join();
+    { std::string why; if (ctx_server.engine_exited(why)) engine_died = true; }
     clean_up();
     if (ctx_http.thread.joinable()) {
         ctx_http.thread.join();

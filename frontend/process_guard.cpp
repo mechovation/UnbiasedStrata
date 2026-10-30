@@ -5,6 +5,11 @@
 #include <climits>
 #include <csignal>
 #include <cstdlib>
+#include <cstdint>
+#include <sys/resource.h>
+#include <limits>
+#include <utility>
+#include <initializer_list>
 #include <sys/prctl.h>
 #include <unistd.h>
 
@@ -20,6 +25,20 @@ int main(int argc, char ** argv) {
     // when that PID namespace's init exits, so reparenting-to-1 cannot hide its death.
     // Guard/target stay in the spawning parent's PID namespace.
     if (::getppid() != expected) return 125;
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return 125;
+    for (const auto & entry : {std::pair<int, const char *>{RLIMIT_AS,"STRATA_PROCESS_AS_BYTES"},
+            {RLIMIT_NOFILE,"STRATA_PROCESS_NOFILE"}, {RLIMIT_FSIZE,"STRATA_PROCESS_FSIZE_BYTES"}, {RLIMIT_CORE,"STRATA_PROCESS_CORE_BYTES"}}) {
+        const char * value = std::getenv(entry.second);
+        if (!value) continue; // legacy foundation callers use their existing bounds
+        if (!*value) return 125;
+        uint64_t number = 0;
+        for (const char * p = value; *p; ++p) {
+            if (*p < '0' || *p > '9' || number > (uint64_t(std::numeric_limits<rlim_t>::max()) - 1 - uint64_t(*p-'0')) / 10) return 125;
+            number = number * 10 + uint64_t(*p-'0');
+        }
+        rlimit limit{rlim_t(number),rlim_t(number)};
+        if (::setrlimit(entry.first,&limit) != 0) return 125;
+    }
     ::execv(argv[2], argv + 3);
     // Fixed classification only: no executable arguments/environment in diagnostics.
     return 126;

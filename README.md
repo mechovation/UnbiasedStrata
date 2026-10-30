@@ -119,6 +119,13 @@ changes it), which read a 1920x1080 dashboard correctly in 15 s of encoding on a
 Flash-Next through `strata` takes the same `--mmproj` (its own BF16 projector) and also needs `--vision` after the
 `--`, or the engine refuses the rows ("this engine was started without --vision"); checked on the 4090, 2026-10-20.
 
+The opt-in **PR4 supervised native-reader path** uses `--native-vision PROFILE`
+with explicit finite resource/process limits and companion reader/guard executables.
+**PR4 implementation, CPU/GPU acceptance and release review are complete** for the
+pinned backend and reviewed 5070 Ti profile. Legacy remains the default; deployment
+is a separate operator decision. See the [vision-stack implementation plan](docs/VISION_IMPLEMENTATION_PLAN.md).
+No early cache or synthetic encode warmup is included.
+
 **Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (`strata`; the two GGUF shards, the pack directory made from shard 1, the MTP
 draft directory). On the 24 GB card:
 

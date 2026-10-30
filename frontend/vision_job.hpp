@@ -20,7 +20,7 @@ struct Recipe {
     uint64_t row_bytes = 0;
 };
 struct Ticket { Kind command; uint64_t instance, job, sequence; uint32_t occurrence; uint64_t handle; };
-enum class Phase { preparing, admitting, encoding, ready_for_engine, engine_active, draining, finalizing, failed, done };
+enum class Phase { preparing, admitting, encoding, ready_for_engine, engine_starting, engine_active, draining, finalizing, failed, done };
 enum class Outcome { success, refused, cancelled, failure };
 enum class Reply { accepted, stale, invalid, remote_error, resource, artifact_error, cancelled };
 class Job {
@@ -33,8 +33,9 @@ class Job {
     };
 public:
     static std::unique_ptr<Job> create(vision_payload::Config config, vision_payload::Limits wire_limits,
-                                       Limits limits, uint64_t instance, uint64_t job, std::vector<Input> inputs) {
-        if (!instance || !job || inputs.empty() || inputs.size() > wire_limits.occurrences ||
+                                       Limits limits, uint64_t instance, uint64_t job, std::vector<Input> inputs, bool text_only = false) {
+        // Text is an explicit no-reader-work job, never an accidentally empty vision job.
+        if (!instance || !job || inputs.empty() != text_only || inputs.size() > wire_limits.occurrences ||
             !limits.recipe_bytes || !limits.image_cells || !limits.positions ||
             limits.image_cells > uint64_t(INT32_MAX) || limits.positions > uint64_t(INT32_MAX) ||
             !config.width || !config.pixel_stride || config.pixel_stride != wire_limits.metadata.pixel_stride ||
@@ -56,7 +57,11 @@ public:
     Job(const Job &) = delete;
     Job & operator=(const Job &) = delete;
     Phase phase() const { return phase_; }
+    uint32_t error_class() const { return error_class_; }
     bool pending() const { return pending_.has_value(); }
+    size_t occurrences() const { return records_.size(); }
+    // Owner-thread borrow only, never retain across asynchronous publication.
+    const Input * input(size_t i) const { return i < records_.size() ? &records_[i].input : nullptr; }
     // Recipe pointer borrows this Job. Queue integration must transfer/copy owned data, not this pointer.
     const Recipe * recipe(size_t i) const { return i < records_.size() && records_[i].handle ? &records_[i].recipe : nullptr; }
     Artifact::Ptr rows(size_t i) const {
@@ -69,7 +74,7 @@ public:
     }
     bool admit(bool accepted) {
         if (phase_ != Phase::admitting || pending_) return false;
-        if (accepted) phase_ = Phase::encoding;
+        if (accepted) phase_ = records_.empty() ? Phase::ready_for_engine : Phase::encoding;
         else { outcome_ = Outcome::refused; phase_ = Phase::finalizing; }
         return true;
     }
@@ -84,8 +89,31 @@ public:
         if (ticket) records_[next_encode_].rows = std::move(output);
         return ticket;
     }
-    bool engine_started() {
+    // LATE cache only: caller copied sealed bytes into newly parent-tagged rows.
+    // No fabricated ENCODE reply/ticket: sequence remains the real reader sequence.
+    bool cached_rows(Artifact::Ptr output, Clock::time_point deadline, const std::atomic<bool> & cancel_flag) {
+        if (phase_ != Phase::encoding || pending_ || !output) return false;
+        const auto & recipe = records_[next_encode_].recipe;
+        if (!(output->tag() == tag(next_encode_)) || output->bytes() != recipe.row_bytes ||
+            output->finish_rows(tag(next_encode_), recipe.shape.x, recipe.shape.y, config_.width,
+                                deadline, cancel_flag) != vision_artifact::Result::ok) return false;
+        records_[next_encode_].rows = std::move(output);
+        if (++next_encode_ == records_.size()) phase_ = Phase::ready_for_engine;
+        return true;
+    }
+    // Reserve the may-start boundary before invoking a native start callback.
+    bool engine_start_requested() {
         if (phase_ != Phase::ready_for_engine || pending_) return false;
+        phase_ = Phase::engine_starting; return true;
+    }
+    // Only after a definitely-unsent start and certified handback of the turn.
+    bool engine_not_started() {
+        if (phase_ != Phase::engine_starting || pending_) return false;
+        if (outcome_ == Outcome::success) outcome_ = Outcome::failure;
+        phase_ = Phase::finalizing; return true;
+    }
+    bool engine_started() {
+        if ((phase_ != Phase::ready_for_engine && phase_ != Phase::engine_starting) || pending_) return false;
         phase_ = Phase::engine_active; return true;
     }
     // Caller has observed terminal drain or confirmed engine termination, not just sent STOP.
@@ -103,14 +131,16 @@ public:
     void cancel() {
         if (phase_ == Phase::done) return;
         outcome_ = Outcome::cancelled;
+        if (phase_ == Phase::engine_starting) return; // start resolution/proof is still owed
         if (phase_ == Phase::engine_active || phase_ == Phase::draining) phase_ = Phase::draining;
         else if (phase_ != Phase::finalizing) fail(); // unknown reader work/handles require teardown
         // After engine drain/context refusal, RELEASE remains bounded cooperative cleanup.
         // A sticky request-cancel flag must not itself abort that cleanup.
     }
     // Invoke for IO/protocol/native faults, not as a shortcut around engine STOP/drain.
+    bool resource_failure() { error_class_ = 2; return reader_failure(); }
     bool reader_failure() {
-        if (phase_ == Phase::engine_active || phase_ == Phase::draining || phase_ == Phase::done) return false;
+        if (phase_ == Phase::engine_starting || phase_ == Phase::engine_active || phase_ == Phase::draining || phase_ == Phase::done) return false;
         fail(); return true;
     }
     // Caller certifies process reaping AND applicable GPU safety checks; this class cannot prove them.
@@ -148,7 +178,7 @@ public:
         if (!vision_payload::validate(frame.header.kind, payload, frame.fd_count, config_, wire_limits_, binding, view)) {
             fail(); return Reply::invalid;
         }
-        if (frame.header.kind == Kind::error) { fail(); return Reply::remote_error; }
+        if (frame.header.kind == Kind::error) { error_class_ = view.error_class; fail(); return Reply::remote_error; }
         if (ticket.command == Kind::prepare) {
             for (const auto & r : records_) if (r.handle == view.handle) { fail(); return Reply::invalid; }
             const uint64_t text_bytes = uint64_t(view.prefix_ids.size()) + view.suffix_ids.size();
@@ -156,7 +186,7 @@ public:
             const uint64_t positions = view.shape.positions + text_bytes / 4;
             const uint64_t cells = view.shape.cells + text_bytes / 4;
             if (bytes > limits_.recipe_bytes - recipe_bytes_ || view.shape.cells > limits_.image_cells - image_cells_ ||
-                positions > limits_.positions - positions_ || cells > uint64_t(INT32_MAX) - cells_) { fail(); return Reply::resource; }
+                positions > limits_.positions - positions_ || cells > uint64_t(INT32_MAX) - cells_) { error_class_ = 2; fail(); return Reply::resource; }
             Recipe owned;
             try { owned = {std::string(view.prefix_ids), std::string(view.suffix_ids), std::string(view.metadata), view.shape, view.row_bytes}; }
             catch (const std::bad_alloc &) { fail(); return Reply::resource; }
@@ -196,13 +226,14 @@ private:
     Outcome outcome_ = Outcome::success;
     std::optional<Ticket> pending_;
     uint64_t sequence_ = 0, recipe_bytes_ = 0, image_cells_ = 0, positions_ = 0, cells_ = 0;
-    uint32_t next_prepare_ = 0, next_encode_ = 0;
+    uint32_t next_prepare_ = 0, next_encode_ = 0, error_class_ = 0;
     bool terminal_sent_ = false;
     Job(vision_payload::Config config, vision_payload::Limits wire_limits, Limits limits,
         uint64_t instance, uint64_t job, std::vector<Input> inputs)
         : config_(config), wire_limits_(wire_limits), limits_(limits), instance_(instance), job_(job) {
         records_.reserve(inputs.size());
         for (auto & in : inputs) records_.push_back({std::move(in), {}, {}, 0, false});
+        if (records_.empty()) phase_ = Phase::admitting;
     }
     vision_artifact::Tag tag(uint32_t i) const { return {instance_, job_, i, records_[i].input.source->tag().source}; }
     std::optional<Ticket> issue(Kind command, uint32_t occurrence) {

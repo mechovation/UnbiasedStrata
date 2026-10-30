@@ -82,6 +82,28 @@ int main() {
     std::ifstream file("frontend/tests/data/pr4-metadata/qwen-still-0.bin", std::ios::binary); assert(file);
     metadata.assign(std::istreambuf_iterator<char>(file), {});
     va::Budget budget({65536, 16});
+    // Explicit text jobs keep admission/start/drain/terminal ownership, but issue
+    // no reader tickets. An accidentally empty vision submission stays invalid.
+    assert(!vj::Job::create(config, caps, {8192,4096,4096}, 7, 11, {}));
+    for (int result = 0; result < 4; ++result) {
+        auto j = vj::Job::create(config, caps, {8192,4096,4096}, 7, 11, {}, true); assert(j);
+        assert(j->phase() == vj::Phase::admitting && !j->prepare() && !j->engine_start_requested());
+        assert(j->admit(result != 0));
+        if (result != 0) {
+            assert(j->phase() == vj::Phase::ready_for_engine && j->engine_start_requested());
+            if (result == 1) assert(j->engine_not_started());
+            else {
+                assert(j->engine_started());
+                if (result == 3) j->cancel();
+                assert(!j->take_terminal() && !j->release());
+                assert(j->engine_terminal(true));
+            }
+        }
+        assert(!j->release() && j->phase() == vj::Phase::done);
+        assert(j->take_terminal() == (result == 0 ? vj::Outcome::refused : result == 1 ? vj::Outcome::failure :
+            result == 2 ? vj::Outcome::success : vj::Outcome::cancelled));
+        assert(!j->take_terminal() && budget.usage().bytes == 0);
+    }
     {
         auto j = job(budget);
         assert(!j->engine_started() && !j->admit(true) && !j->encode(output(budget, 0)));

@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 using namespace strata_frontend;
 using namespace std::chrono_literals;
@@ -32,6 +33,13 @@ int main(int argc, char ** argv) {
     assert(argc >= 3);
     self = argv[0]; guard = argv[2];
     const std::string mode = argv[1];
+    if (mode == "limits") {
+        for (const auto & entry : {std::pair<int,rlim_t>{RLIMIT_AS,512*1024*1024}, {RLIMIT_NOFILE,32}, {RLIMIT_FSIZE,1024}, {RLIMIT_CORE,0}}) {
+            rlimit limit{}; assert(::getrlimit(entry.first,&limit) == 0 && limit.rlim_cur == entry.second && limit.rlim_max == entry.second);
+        }
+        assert(::prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0) == 1);
+        assert(::write(1,"R",1) == 1); return 0;
+    }
     if (mode == "hang" || mode == "eof" || mode == "socket") {
         int death_signal = 0;
         assert(::prctl(PR_GET_PDEATHSIG, &death_signal) == 0 && death_signal == SIGKILL);
@@ -73,6 +81,15 @@ int main(int argc, char ** argv) {
     assert(mode == "test");
     assert(::prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
     int status = 0;
+    for (const auto & value : {std::string("32"),std::string("-1"),std::string("18446744073709551615"),std::string("unlimited")}) {
+        SpawnedProcess limited; std::string error;
+        assert(protected_spawn(guard,self,{self,"limits",guard},
+            {"STRATA_PROCESS_AS_BYTES=536870912","STRATA_PROCESS_NOFILE="+value,"STRATA_PROCESS_FSIZE_BYTES=1024","STRATA_PROCESS_CORE_BYTES=0"},
+            2,limited,error));
+        if (value == "32") assert(read_byte(limited.output) == 'R');
+        assert(reap_until(limited.pid,ProcessClock::now()+2s,status) == ReapResult::reaped && WIFEXITED(status));
+        assert(WEXITSTATUS(status) == (value == "32" ? 0 : 125)); close_pipes(limited);
+    }
     auto child = spawn("hang");
     assert(read_byte(child.output) == 'R');
     auto start = ProcessClock::now();

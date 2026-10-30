@@ -27,7 +27,11 @@ struct strata_context {
     // Registers the HTTP routes on `http`. Handlers run only once http.is_ready is set, after load().
     void init_routes(server_http_context & http);
 
-    // fork+exec the engine. Call before any thread exists (before http.start()).
+    // Opt-in supervised candidate, with an explicit finite resource profile. Does
+    // not deploy or authorize GPU use; configure before start_engine/load.
+    void configure_native(const std::string & profile, const std::string & guard, const std::string & reader);
+
+    // Legacy: fork+exec before threads. Native: records launch for the owner in load().
     bool start_engine(const common_params & params, const std::string & engine_exe, const std::vector<std::string> & engine_args, std::string & err);
 
     // Loads the vocabulary and chat template from the GGUF (vocab only, no tensors) and waits for the engine's READY.

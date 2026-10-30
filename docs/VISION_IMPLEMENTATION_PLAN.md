@@ -1,6 +1,6 @@
 # Vision improvement implementation plan
 
-**Original planning snapshot; subsequent implementation status:** PR1–3 and Spike A are checkpointed, and PR4 CPU foundations are in progress. See [the PR4 handoff](PR4_HANDOFF.md) for current authorization, evidence and remaining gates. PR4 is incomplete; PR5–7 remain excluded.
+**Original planning snapshot; final PR4 status:** PR1–3 and Spike A are checkpointed. **PR4 implementation, CPU/GPU acceptance and release review are COMPLETE (2026-10-30)**. No PR4 gate remains open. Production is restored healthy; deployment/default activation is separate. PR5–7 remain excluded. Historical planning milestones below are not current unfinished PR4 work.
 
 Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf60f0`, llama.cpp submodule `44072a19fb94d0bed63d381d42f6237373f91d54`. This is the technical execution plan, not a replacement for the [behavioral specification](VISION_STACK_REVIEW.md), [performance evidence](VISION_STACK_BENCHMARK.md), or [issue reproductions](VISION_ISSUE_VALIDATION.md).
 
