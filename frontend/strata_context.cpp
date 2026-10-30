@@ -300,6 +300,18 @@ struct strata_context_impl {
         while (auto notice = native_vision->poll()) {
             if (!slot.native || !slot.active() || notice->identity.task != uint64_t(slot.task->id) + 1) continue;
             if (notice->kind == N::prompt) {
+                if (!notice->composed->regenerated.is_null()) {
+                    try {
+                        auto fresh = server_schema::eval_llama_cmpl_schema(vocab,params,logit_bias_eog,notice->composed->regenerated);
+                        const auto & previous = slot.task->params;
+                        if (fresh.n_cmpl != previous.n_cmpl || fresh.stream != previous.stream || fresh.n_predict != previous.n_predict)
+                            throw std::runtime_error("regenerated request settings mismatch");
+                        fresh.res_type = previous.res_type;
+                        fresh.oaicompat_cmpl_id = previous.oaicompat_cmpl_id;
+                        fresh.oaicompat_model = previous.oaicompat_model;
+                        slot.task->params = std::move(fresh);
+                    } catch (...) { native_vision->reject_prompt(); continue; }
+                }
                 slot.native_tokens = std::shared_ptr<const server_tokens>(notice->composed, &notice->composed->tokens);
                 const auto room = slot.native_tokens->empty() ? int64_t(0) : n_ctx - int64_t(slot.native_tokens->size()) - ENGINE_CONTEXT_RESERVE;
                 slot.n_predict = slot.task->params.n_predict;
@@ -1217,7 +1229,8 @@ struct strata_context_impl {
     // (a control token's text inside a message, literals.hpp)
     std::unique_ptr<res_generator> handle_completions(const server_http_req & req, const json & data,
                                                       const std::vector<raw_buffer> & files, task_response_type res_type,
-                                                      const std::vector<std::pair<size_t, size_t>> & plain = {}) {
+                                                      const std::vector<std::pair<size_t, size_t>> & plain = {},
+                                                      std::shared_ptr<const strata_frontend::vision_chat::Chat> chat = {}) {
         auto res = create_response();
         auto completion_id = gen_chatcmplid();
         auto & rd = res->rd;
@@ -1263,7 +1276,7 @@ struct strata_context_impl {
                 strata_frontend::vision_queue::Error rejection = strata_frontend::vision_queue::Error::unavailable;
                 res->request_control = native_vision->enqueue(task.id, native_media ? prompt.get<std::string>() : std::string(),
                     native_media ? plain : std::vector<std::pair<size_t, size_t>>{}, files,
-                    native_media ? llama_tokens{} : task.tokens.get_text_tokens(), &rejection);
+                    native_media ? llama_tokens{} : task.tokens.get_text_tokens(), &rejection, std::move(chat));
                 if (!res->request_control) {
                     res->error(format_error_response("native request admission/resource limit exceeded",
                         rejection == strata_frontend::vision_queue::Error::unavailable ? ERROR_TYPE_UNAVAILABLE : ERROR_TYPE_INVALID_REQUEST)); return res;
@@ -1663,7 +1676,14 @@ void strata_context::init_routes(server_http_context & http) {
     // a control token's text inside a message stays text (literals.hpp): marked before the template renders,
     // unmarked after, and the spans it covered are tokenized as text
     auto parse_chat = [I](json & body, std::vector<raw_buffer> & files, std::vector<std::pair<size_t, size_t>> & plain,
-                          const std::function<bool()> & cancelled) {
+                          const std::function<bool()> & cancelled,
+                          std::shared_ptr<const strata_frontend::vision_chat::Chat> * acquired = nullptr) {
+        std::shared_ptr<strata_frontend::vision_chat::Chat> owned;
+        if (I->native_vision && acquired) {
+            owned = std::make_shared<strata_frontend::vision_chat::Chat>(body,I->chat_params,I->literals);
+            if (owned->count() > I->native_vision->occurrence_limit())
+                throw strata_acquisition::Error(400,"native image occurrence limit exceeded");
+        }
         // Acquire before templating, preserving occurrence order. No service headers are forwarded.
         if (I->chat_params.allow_image) {
             strata_acquisition::acquire_images(body, strata_acquisition::Policy::environment(), cancelled);
@@ -1674,6 +1694,11 @@ void strata_context::init_routes(server_http_context & http) {
             marked = I->literals.mark_request(body.at("messages"), tools);
         }
         json data = oaicompat_chat_params_parse(body, I->chat_params, files);
+        if (owned && !files.empty()) {
+            try { owned->bind(files,I->native_vision->pending_limit()); }
+            catch (const std::invalid_argument &) { throw strata_acquisition::Error(400,"native chat regeneration admission limit exceeded"); }
+            *acquired = std::move(owned);
+        }
         if (marked) {
             std::string prompt = data.at("prompt").get<std::string>();
             plain = I->literals.unmark(prompt);
@@ -1690,8 +1715,9 @@ void strata_context::init_routes(server_http_context & http) {
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
         try {
-            json body_parsed = parse_chat(body, files, plain, req.should_stop);
-            auto res = I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
+            std::shared_ptr<const strata_frontend::vision_chat::Chat> acquired;
+            json body_parsed = parse_chat(body, files, plain, req.should_stop, &acquired);
+            auto res = I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain, std::move(acquired));
             res->http_charge = std::move(charge); return res;
         } catch (const strata_acquisition::Error & e) {
             auto res = I->create_response();

@@ -102,13 +102,16 @@ public:
     bool prepare(uint64_t task, std::unique_ptr<vision_job_io::Submission> & submission) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!task || !submission || !vision_job_io::valid(*submission) || submission->job <= last_job_ ||
-            busy_ || claimed_ || shutdown_ || (state_ != State::ready && !(submission->text_only && text_available()))) return false;
+            busy_ || claimed_ || shutdown_ || (state_ != State::ready &&
+                !((submission->text_only || submission->complete_only) && text_available()))) return false;
         auto event = inbox_->reserve(); auto terminal = inbox_->reserve();
         if (!event || !terminal) return false;
         Pending pending{Command::prepare, task, std::move(event)};
         pending.identity = {task, instance_, submission->job};
         pending.terminal = std::move(terminal);
-        request_ = submission->control; identity_ = pending.identity;
+        request_ = submission->control;
+        reader_request_ = submission->work_control ? submission->work_control : submission->control;
+        identity_ = pending.identity;
         last_job_ = submission->job; claimed_ = true; admission_claimed_ = false; engine_claimed_ = false;
         pending.submission = std::move(submission);
         pending_.emplace(std::move(pending)); busy_ = true; cv_.notify_one(); return true;
@@ -167,6 +170,7 @@ public:
             // Publish cancellation before shutdown becomes visible to the IO
             // owner. It must not finalize/reset request_ in between these steps.
             if (request_) request_->cancel(vision_control::Reason::cancelled);
+            if (reader_request_) reader_request_->cancel(vision_control::Reason::cancelled);
             shutdown_.store(true);
         }
         cv_.notify_one();
@@ -214,7 +218,7 @@ private:
     bool busy_ = false, claimed_ = false, admission_claimed_ = false, engine_claimed_ = false;
     uint64_t last_job_ = 0;
     vision_job_io::Identity identity_{};
-    std::shared_ptr<vision_control::Request> request_;
+    std::shared_ptr<vision_control::Request> request_, reader_request_;
     std::shared_ptr<const vision_job_io::Prepared> prepared_;
     std::shared_ptr<const vision_job_io::Encoded> encoded_;
     std::optional<vision_job_io::Terminal> terminal_result_;
@@ -263,6 +267,7 @@ private:
     // in READY/PREPARE/ENCODE/RELEASE transport. No second engine poller/reaper or
     // thread is introduced. healthy() is idle-only and must never load/restart.
     bool reader_health() noexcept {
+        if (job_) job_->observe_reader();
         if (shutdown_.load() || !engine_) return true;
         if (!safety_->healthy()) { engine_died(); return false; }
         if (engine_handoff_ || engine_->healthy()) return true;
@@ -421,13 +426,18 @@ private:
     }
     void publish_terminal(vision_job::Outcome outcome) {
         // Owner has certified cleanup, or this submission never reached the child.
+        if (outcome == vision_job::Outcome::input_error && (shutdown_ || service_failure_))
+            outcome = vision_job::Outcome::failure;
         const uint32_t error_class = job_ ? job_->error_class() : 0;
         const bool timed_out = job_ && job_->timed_out();
+        const auto input_failure = job_ && outcome == vision_job::Outcome::input_error && !error_class && !timed_out ?
+            job_->input_failure() : std::optional<vision_payload::InputFailure>{};
+        if (outcome == vision_job::Outcome::input_error && !input_failure) std::terminate();
         job_.reset();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            prepared_.reset(); encoded_.reset(); request_.reset();
-            terminal_result_ = vision_job_io::Terminal{owner_identity_, outcome, error_class, timed_out};
+            prepared_.reset(); encoded_.reset(); request_.reset(); reader_request_.reset();
+            terminal_result_ = vision_job_io::Terminal{owner_identity_, outcome, error_class, timed_out, input_failure};
         }
         terminal_event_.publish({owner_identity_.task, owner_identity_.instance, owner_identity_.job, 0,
                                  vision_control::Event::Kind::job_terminal});
@@ -441,7 +451,8 @@ private:
     }
     vision_control::Event::Kind job_command(Pending & work) {
         using E = vision_control::Event::Kind;
-        const bool text_without_reader = work.command == Command::prepare && work.submission && work.submission->text_only &&
+        const bool text_without_reader = work.command == Command::prepare && work.submission &&
+            (work.submission->text_only || work.submission->complete_only) &&
             !channel_ && text_available();
         if ((state_ != State::ready || !channel_) && !text_without_reader && !readerless_job_) { reject_job(work); return E::unavailable; }
         auto & channel = channel_ ? *channel_ : no_reader_;
@@ -461,6 +472,11 @@ private:
                 }
                 state_ = State::preparing;
                 if (!job_->prepare(channel, shutdown_)) { failed(); return E::failed; }
+                if (auto terminal = job_->terminal()) {
+                    // Typed PREPARE rejection, after cooperative release of every
+                    // earlier handle. The reader/lease remain alive and reusable.
+                    publish_terminal(*terminal); state_ = State::ready; return E::completed;
+                }
                 { std::lock_guard<std::mutex> lock(mutex_); prepared_ = job_->prepared(); }
                 state_ = State::ready; return E::prepared;
             }
@@ -542,7 +558,13 @@ private:
                     }
                 }
             }
-            if (!shutdown_.load() && state_ == State::ready && job_ && job_->cancelled()) failed();
+            if (!shutdown_.load() && state_ == State::ready && job_ && job_->cancelled()) {
+                if (job_->encoded() && job_->abandon(channel_ ? *channel_ : no_reader_,shutdown_)) {
+                    auto terminal = job_->terminal(); if (!terminal) std::terminate();
+                    finish_text_lease(); publish_terminal(*terminal);
+                    state_ = readerless_job_ ? readerless_return_ : State::ready; readerless_job_ = false;
+                } else failed();
+            }
             if (!shutdown_.load() && child_.pid > 0 && (state_ == State::ready || engine_handoff_)) {
                 int status = 0;
                 const auto rc = reap_until(child_.pid, Clock::now(), status);

@@ -12,7 +12,7 @@ namespace strata_frontend::vision_job {
 using Kind = vision_protocol::Kind;
 using Artifact = vision_artifact::Artifact;
 using Clock = vision_protocol::Clock;
-struct Input { Artifact::Ptr source; std::string metadata_id; };
+struct Input { Artifact::Ptr source; std::string metadata_id; bool omit_unreadable = false; };
 struct Limits { uint64_t recipe_bytes, image_cells, positions; };
 struct Recipe {
     std::string prefix_ids, suffix_ids, metadata; // owned, no pointers into a transport frame
@@ -21,8 +21,8 @@ struct Recipe {
 };
 struct Ticket { Kind command; uint64_t instance, job, sequence; uint32_t occurrence; uint64_t handle; };
 enum class Phase { preparing, admitting, encoding, ready_for_engine, engine_starting, engine_active, draining, finalizing, failed, done };
-enum class Outcome { success, refused, cancelled, failure };
-enum class Reply { accepted, stale, invalid, remote_error, resource, artifact_error, cancelled };
+enum class Outcome { success, refused, cancelled, failure, input_error };
+enum class Reply { accepted, stale, invalid, remote_error, resource, artifact_error, cancelled, input_error };
 class Job {
     struct Record {
         Input input;
@@ -30,6 +30,8 @@ class Job {
         Artifact::Ptr rows;
         uint64_t handle = 0; // retained after RELEASE to reject handle reuse within a job
         bool released = false;
+        bool prepared = false; // cache/duplicate occurrences have no reader handle
+        bool omitted = false;
     };
 public:
     static std::unique_ptr<Job> create(vision_payload::Config config, vision_payload::Limits wire_limits,
@@ -58,12 +60,14 @@ public:
     Job & operator=(const Job &) = delete;
     Phase phase() const { return phase_; }
     uint32_t error_class() const { return error_class_; }
+    std::optional<vision_payload::InputFailure> input_failure() const { return input_failure_; }
     bool pending() const { return pending_.has_value(); }
     size_t occurrences() const { return records_.size(); }
     // Owner-thread borrow only, never retain across asynchronous publication.
     const Input * input(size_t i) const { return i < records_.size() ? &records_[i].input : nullptr; }
     // Recipe pointer borrows this Job. Queue integration must transfer/copy owned data, not this pointer.
-    const Recipe * recipe(size_t i) const { return i < records_.size() && records_[i].handle ? &records_[i].recipe : nullptr; }
+    const Recipe * recipe(size_t i) const { return i < records_.size() && records_[i].prepared ? &records_[i].recipe : nullptr; }
+    bool omitted(size_t i) const { return i < records_.size() && records_[i].omitted; }
     Artifact::Ptr rows(size_t i) const {
         return i < records_.size() && records_[i].rows && records_[i].rows->validated_rows() ? records_[i].rows : nullptr;
     }
@@ -72,9 +76,36 @@ public:
         if (phase_ != Phase::preparing || pending_) return {};
         return issue(Kind::prepare, next_prepare_);
     }
+    // Imported only from a complete parent cache entry, or an earlier validated
+    // same-source occurrence in THIS job. No synthetic IPC reply/handle/sequence.
+    bool reuse_recipe(const Recipe & recipe) {
+        if (phase_ != Phase::preparing || pending_) return false;
+        const auto & in = records_[next_prepare_].input;
+        vision_metadata::Shape shape{};
+        if (!vision_metadata::preflight(recipe.metadata, in.metadata_id, wire_limits_.metadata, shape) ||
+            shape.x != recipe.shape.x || shape.y != recipe.shape.y || shape.cells != recipe.shape.cells ||
+            shape.positions != recipe.shape.positions || recipe.prefix_ids.size() % 4 || recipe.suffix_ids.size() % 4 ||
+            recipe.prefix_ids.size()/4 > wire_limits_.text_tokens ||
+            recipe.suffix_ids.size()/4 > wire_limits_.text_tokens - recipe.prefix_ids.size()/4 ||
+            shape.cells > wire_limits_.row_bytes / 4 / config_.width ||
+            recipe.row_bytes != uint64_t(shape.cells)*config_.width*4) return false;
+        for (const auto * ids : {&recipe.prefix_ids,&recipe.suffix_ids})
+            for (size_t i = 0; i < ids->size(); i += 4)
+                if (vision_protocol::little(reinterpret_cast<const uint8_t *>(ids->data()+i),4) >= config_.vocabulary_size) return false;
+        const auto bytes = uint64_t(recipe.metadata.size()) + recipe.prefix_ids.size() + recipe.suffix_ids.size();
+        const auto text = (recipe.prefix_ids.size() + recipe.suffix_ids.size()) / 4;
+        if (bytes > limits_.recipe_bytes - recipe_bytes_ || shape.cells > limits_.image_cells - image_cells_ ||
+            shape.positions + text > limits_.positions - positions_ || shape.cells + text > uint64_t(INT32_MAX) - cells_) {
+            resource_failure(); return false;
+        }
+        records_[next_prepare_].recipe = recipe; records_[next_prepare_].prepared = true;
+        recipe_bytes_ += bytes; image_cells_ += shape.cells; positions_ += shape.positions + text; cells_ += shape.cells + text;
+        if (++next_prepare_ == records_.size()) phase_ = Phase::admitting;
+        return true;
+    }
     bool admit(bool accepted) {
         if (phase_ != Phase::admitting || pending_) return false;
-        if (accepted) phase_ = records_.empty() ? Phase::ready_for_engine : Phase::encoding;
+        if (accepted) { phase_ = Phase::encoding; advance_encode(); }
         else { outcome_ = Outcome::refused; phase_ = Phase::finalizing; }
         return true;
     }
@@ -89,7 +120,7 @@ public:
         if (ticket) records_[next_encode_].rows = std::move(output);
         return ticket;
     }
-    // LATE cache only: caller copied sealed bytes into newly parent-tagged rows.
+    // Reused rows: caller copied sealed bytes into newly parent-tagged storage.
     // No fabricated ENCODE reply/ticket: sequence remains the real reader sequence.
     bool cached_rows(Artifact::Ptr output, Clock::time_point deadline, const std::atomic<bool> & cancel_flag) {
         if (phase_ != Phase::encoding || pending_ || !output) return false;
@@ -98,8 +129,13 @@ public:
             output->finish_rows(tag(next_encode_), recipe.shape.x, recipe.shape.y, config_.width,
                                 deadline, cancel_flag) != vision_artifact::Result::ok) return false;
         records_[next_encode_].rows = std::move(output);
-        if (++next_encode_ == records_.size()) phase_ = Phase::ready_for_engine;
+        ++next_encode_; advance_encode();
         return true;
+    }
+    // Cancelled producer finished shared reader work; never send its GEN(I).
+    bool abandon_engine() {
+        if (phase_ != Phase::ready_for_engine || pending_) return false;
+        outcome_ = Outcome::cancelled; phase_ = Phase::finalizing; return true;
     }
     // Reserve the may-start boundary before invoking a native start callback.
     bool engine_start_requested() {
@@ -168,7 +204,8 @@ public:
         }
         if (Clock::now() >= deadline) { fail(); return Reply::invalid; }
         Kind expected = ticket.command == Kind::prepare ? Kind::prepared : ticket.command == Kind::encode ? Kind::encoded : Kind::released;
-        if ((frame.header.kind != expected && frame.header.kind != Kind::error) ||
+        if ((frame.header.kind != expected && frame.header.kind != Kind::error &&
+                !(ticket.command == Kind::prepare && frame.header.kind == Kind::input_rejected)) ||
             frame.header.payload_size != frame.payload.size() || frame.fd_count) { fail(); return Reply::invalid; }
         auto & record = records_[ticket.occurrence];
         vision_payload::Binding binding{ticket.occurrence, record.input.source->tag().source,
@@ -179,6 +216,23 @@ public:
             fail(); return Reply::invalid;
         }
         if (frame.header.kind == Kind::error) { error_class_ = view.error_class; fail(); return Reply::remote_error; }
+        if (frame.header.kind == Kind::input_rejected) {
+            if (phase_ != Phase::preparing) { fail(); return Reply::invalid; }
+            if (record.input.omit_unreadable) {
+                record.omitted = true; pending_.reset();
+                if (++next_prepare_ == records_.size()) phase_ = Phase::admitting;
+                if (cancel_flag.load()) { cancel(); return Reply::cancelled; }
+                if (Clock::now() >= deadline) { fail(); return Reply::invalid; }
+                return Reply::accepted;
+            }
+            input_failure_ = vision_payload::InputFailure{ticket.occurrence,view.input_error};
+            outcome_ = Outcome::input_error; phase_ = Phase::finalizing; pending_.reset();
+            // The typed reply proves no work/handle for this occurrence. Earlier
+            // handles still require bounded RELEASE, even if cancellation is sticky.
+            if (cancel_flag.load()) cancel();
+            if (Clock::now() >= deadline) { fail(); return Reply::invalid; }
+            return Reply::input_error;
+        }
         if (ticket.command == Kind::prepare) {
             for (const auto & r : records_) if (r.handle == view.handle) { fail(); return Reply::invalid; }
             const uint64_t text_bytes = uint64_t(view.prefix_ids.size()) + view.suffix_ids.size();
@@ -190,7 +244,7 @@ public:
             Recipe owned;
             try { owned = {std::string(view.prefix_ids), std::string(view.suffix_ids), std::string(view.metadata), view.shape, view.row_bytes}; }
             catch (const std::bad_alloc &) { fail(); return Reply::resource; }
-            record.recipe = std::move(owned); record.handle = view.handle;
+            record.recipe = std::move(owned); record.handle = view.handle; record.prepared = true;
             recipe_bytes_ += bytes; image_cells_ += view.shape.cells; positions_ += positions; cells_ += cells;
             if (++next_prepare_ == records_.size()) phase_ = Phase::admitting;
         } else if (ticket.command == Kind::encode) {
@@ -199,7 +253,7 @@ public:
                 if (result == vision_artifact::Result::cancelled) { cancel(); return Reply::cancelled; }
                 fail(); return Reply::artifact_error;
             }
-            if (++next_encode_ == records_.size()) phase_ = Phase::ready_for_engine;
+            ++next_encode_; advance_encode();
         } else {
             record.released = true;
         }
@@ -225,6 +279,7 @@ private:
     Phase phase_ = Phase::preparing;
     Outcome outcome_ = Outcome::success;
     std::optional<Ticket> pending_;
+    std::optional<vision_payload::InputFailure> input_failure_;
     uint64_t sequence_ = 0, recipe_bytes_ = 0, image_cells_ = 0, positions_ = 0, cells_ = 0;
     uint32_t next_prepare_ = 0, next_encode_ = 0, error_class_ = 0;
     bool terminal_sent_ = false;
@@ -235,6 +290,10 @@ private:
         for (auto & in : inputs) records_.push_back({std::move(in), {}, {}, 0, false});
         if (records_.empty()) phase_ = Phase::admitting;
     }
+    void advance_encode() {
+        while (next_encode_ < records_.size() && records_[next_encode_].omitted) ++next_encode_;
+        if (next_encode_ == records_.size()) phase_ = Phase::ready_for_engine;
+    }
     vision_artifact::Tag tag(uint32_t i) const { return {instance_, job_, i, records_[i].input.source->tag().source}; }
     std::optional<Ticket> issue(Kind command, uint32_t occurrence) {
         if (sequence_ == UINT64_MAX) { fail(); return {}; }
@@ -242,7 +301,7 @@ private:
         pending_ = t; return t;
     }
     void fail() {
-        if (outcome_ == Outcome::success) outcome_ = Outcome::failure;
+        if (outcome_ == Outcome::success || outcome_ == Outcome::input_error) outcome_ = Outcome::failure;
         phase_ = Phase::failed; // keep pending identity, handles and every artifact until safe teardown
     }
     void complete() {

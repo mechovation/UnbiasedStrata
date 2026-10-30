@@ -4,6 +4,7 @@
 #pragma once
 #include "vision_queue.hpp"
 #include "vision_reader.hpp"
+#include "vision_image.hpp"
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 #include <openssl/evp.h>
@@ -19,7 +20,7 @@
 namespace strata_frontend::vision_runtime {
 using Json = nlohmann::ordered_json;
 inline constexpr const char * approved_gpu = "GPU-d14daf49-45c8-58c5-cf61-5a40342672af";
-inline constexpr const char * pinned_abi = "44072a19fb94d0bed63d381d42f6237373f91d54/mtmd-v2/qwen3vl-merge2/pr4-runtime-v1";
+inline constexpr const char * pinned_abi = "44072a19fb94d0bed63d381d42f6237373f91d54/mtmd-v2/qwen3vl-merge2/pr6-runtime-v3-tool-omission";
 inline constexpr size_t json_cap = 65536;
 [[noreturn]] inline void invalid() { throw std::runtime_error("invalid native vision configuration"); }
 inline void require(bool ok) { if (!ok) invalid(); }
@@ -109,7 +110,7 @@ inline void validate_engine_args(const std::vector<std::string> & args) {
             require(s != forbidden);
     }
 }
-inline void validate_environment(const Json & env) {
+inline void validate_environment(const Json & env, bool engine = false) {
     require(env.is_object() && env.size() <= 20);
     for (auto it = env.begin(); it != env.end(); ++it) {
         auto v = text(env, it.key().c_str()); const auto & k = it.key();
@@ -121,6 +122,9 @@ inline void validate_environment(const Json & env) {
                 at = end + 1;
             } while (true);
         } else if (k == "CUDA_MODULE_LOADING") require(v == "LAZY" || v == "EAGER");
+        // Poly tests presence, not a boolean value: even "0" would freeze it.
+        // Opt in explicitly for the engine only; omission is the sole off state.
+        else if (k == "STRATA_FREEZE_EXPERTS") require(engine && v == "1");
         else {
             uint64_t maximum = 0, minimum = 0;
             if (k == "OMP_NUM_THREADS" || k == "STRATA_IO_THREADS" || k == "STRATA_FETCH_THREADS" ||
@@ -221,7 +225,7 @@ struct Runtime {
             "parent_as_bytes", "parent_nofile", "parent_core_bytes", "engine_as_bytes", "engine_nofile", "engine_fsize_bytes", "engine_core_bytes",
             "image_min_tokens", "batch_max_tokens"});
         require(number(p, "version", 1) == 1 && text(p, "gpu_uuid") == approved_gpu);
-        validate_environment(p["engine_environment"]); validate_environment(p["reader_environment"]);
+        validate_environment(p["engine_environment"], true); validate_environment(p["reader_environment"]);
         Runtime r; r.profile_ = p;
         auto n = [&](const char * name, uint64_t cap = INT64_MAX) { return number(p, name, cap); };
         auto u = [&](const char * name) { return uint32_t(n(name, INT32_MAX)); };
@@ -255,8 +259,12 @@ struct Runtime {
         require(r.queue_limits.pending_count <= n("cgroup_pids_max") && r.artifact_fds <= n("parent_nofile") &&
                 r.queue_limits.output_records <= memory / sizeof(vision_queue::Output::Record) &&
                 r.queue_limits.inbox_events <= memory / sizeof(vision_control::Event));
+        require(r.reader_limits.source_dimension <= uint32_t(INT32_MAX / 4) &&
+                r.reader_limits.source_pixels <= UINT64_MAX / vision_image::workspace_per_pixel);
+        const auto normalization_bytes = r.reader_limits.source_pixels * vision_image::workspace_per_pixel;
+        require(normalization_bytes <= n("reader_as_bytes"));
         uint64_t remaining = memory;
-        for (auto bytes : {r.artifact_bytes,uint64_t(r.queue_limits.pending_bytes),r.recipe_bytes,uint64_t(r.wire_limits.payload_bytes),
+        for (auto bytes : {normalization_bytes,r.artifact_bytes,uint64_t(r.queue_limits.pending_bytes),r.recipe_bytes,uint64_t(r.wire_limits.payload_bytes),
                 uint64_t(r.queue_limits.output_records)*sizeof(vision_queue::Output::Record),
                 uint64_t(r.queue_limits.inbox_events)*sizeof(vision_control::Event)}) {
             require(bytes <= remaining); remaining -= bytes;
@@ -338,6 +346,16 @@ private:
             out.push_back(std::string(field.first) + "=" + std::to_string(number(profile_,(prefix+field.second).c_str(),INT64_MAX,0)));
         return out;
     }
+    static Json image_libraries() {
+        Json out = Json::array();
+        for (const auto & library : vision_image::libraries()) {
+            const auto path = canonical_path(library.path);
+            const auto bytes = std::filesystem::file_size(path);
+            require(bytes);
+            out.push_back({{"role", library.role}, {"sha256", hex(hash_file(path, bytes))}});
+        }
+        require(out.size() >= 4); return out;
+    }
     void resolve() {
         const auto inspected = inspect_artifacts(model_path, projector_path);
         config.width = inspected.width; config.pixel_stride = inspected.stride;
@@ -355,7 +373,10 @@ private:
             {"abi", std::string(pinned_abi) + "/ptr" + std::to_string(sizeof(void *)) + "/size" + std::to_string(sizeof(size_t)) +
                 (uint16_t(1) == *reinterpret_cast<const uint8_t *>(&endian_probe_) ? "/le" : "/be")},
             {"reader_policy", {{"vocab_only", true}, {"n_gpu_layers", 0}, {"warmup", gpu}, {"print_timings", false},
-                {"flash_attention", "auto"}, {"control_fd", 3}, {"vision_only", true}, {"merge", 2}}},
+                {"flash_attention", "auto"}, {"control_fd", 3}, {"vision_only", true}, {"merge", 2},
+                {"image_policy", vision_image::policy},
+                {"normalization_workspace_bytes", reader_limits.source_pixels * vision_image::workspace_per_pixel},
+                {"image_libraries", image_libraries()}}},
             {"engine_environment", environment(profile_["engine_environment"], false)}, {"reader_environment", environment(profile_["reader_environment"], true)},
             {"family", inspected.family}, {"device", gpu ? approved_gpu : "cpu"},
             {"model_sha256", hex(inspected.model_hash)}, {"projector_sha256", hex(inspected.projector_hash)},

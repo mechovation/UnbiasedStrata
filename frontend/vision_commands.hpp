@@ -22,7 +22,8 @@ enum class Result { ok, invalid, resource };
 // resulting bytes pass the same validator used at the receiving trust boundary.
 inline Result build(Kind kind, const vision_payload::Config & config,
                     const vision_payload::Limits & limits, const vision_payload::Binding & binding,
-                    Payload & out, const Prepared & prepared = {}, uint32_t error_class = 0) {
+                    Payload & out, const Prepared & prepared = {}, uint32_t error_class = 0,
+                    vision_payload::InputError input_error = vision_payload::InputError::none) {
     size_t size = 32;
     const auto add = [&](size_t n) {
         if (size > limits.payload_bytes || n > limits.payload_bytes - size) return false;
@@ -34,6 +35,9 @@ inline Result build(Kind kind, const vision_payload::Config & config,
         case Kind::ready: if (!add(32)) return Result::invalid; break;
         case Kind::quit: if (!add(0)) return Result::invalid; break;
         case Kind::error: if (!add(4)) return Result::invalid; break;
+        case Kind::input_rejected:
+            if (!add(48)) return Result::invalid;
+            break;
         case Kind::prepare:
             if (!add(44)) return Result::invalid;
             fds = 1; break;
@@ -73,7 +77,8 @@ inline Result build(Kind kind, const vision_payload::Config & config,
         } else if (kind == Kind::error) integer(error_class, 4);
         else if (kind != Kind::quit) {
             integer(binding.occurrence, 4); raw(binding.source.data(), binding.source.size());
-            if (kind == Kind::prepare) integer(binding.source_bytes, 8);
+            if (kind == Kind::input_rejected) { integer(binding.source_bytes, 8); integer(uint32_t(input_error), 4); }
+            else if (kind == Kind::prepare) integer(binding.source_bytes, 8);
             else {
                 integer(kind == Kind::prepared ? prepared.handle : binding.handle, 8);
                 if (kind == Kind::prepared) {

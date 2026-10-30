@@ -2,10 +2,12 @@
 #include "vision_artifact.hpp"
 #include "vision_commands.hpp"
 #include "vision_transport.hpp"
+#include "vision_image.hpp"
 #include "mtmd.h"
 #include "vendor/hash/hash.h"
 #include "vendor/stb/stb_image.h" // declarations; implementation is in pinned libmtmd
 #include <memory>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@ namespace {
 using Chunks = std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)>;
 struct Record {
     vision_payload::Digest source{};
+    uint32_t occurrence = 0;
     std::string id;
     uint64_t bytes = 0, handle = 0, rgb = 0, recipe_bytes = 0;
     Chunks chunks{nullptr, mtmd_input_chunks_free};
@@ -36,7 +39,8 @@ class Reader {
     Limits limits_;
     uint64_t instance_, job_ = 0, sequence_ = 0, next_handle_ = 0, rgb_ = 0, recipes_ = 0;
     bool encoding_ = false, releasing_ = false;
-    uint32_t next_encode_ = 0, prepare_error_ = 1;
+    uint32_t next_encode_ = 0, prepare_error_ = 1, last_prepare_ = UINT32_MAX;
+    vision_payload::InputError input_error_ = vision_payload::InputError::none;
     vp::Channel channel_;
     const std::atomic<bool> never_{false};
     std::vector<Record> records_;
@@ -45,15 +49,16 @@ class Reader {
         return limits_.io > vp::Clock::time_point::max() - now ? vp::Clock::time_point::max() : now + limits_.io;
     }
     bool send(Kind kind, uint64_t job, uint64_t sequence, const vision_payload::Binding & binding = {},
-              const vision_commands::Prepared & prepared = {}, uint32_t error = 0) {
+              const vision_commands::Prepared & prepared = {}, uint32_t error = 0,
+              vision_payload::InputError input_error = vision_payload::InputError::none) {
         vision_commands::Payload payload;
-        if (vision_commands::build(kind, config_, caps_, binding, payload, prepared, error) != vision_commands::Result::ok) return false;
+        if (vision_commands::build(kind, config_, caps_, binding, payload, prepared, error, input_error) != vision_commands::Result::ok) return false;
         return channel_.send_borrowed({kind, uint32_t(payload.bytes.size()), instance_, job, sequence},
             payload.bytes.data(), payload.bytes.size(), nullptr, 0, caps_.payload_bytes, until(), never_) == vp::IoResult::ok;
     }
     bool prepare(Record & record, int fd, vision_commands::Prepared & prepared,
                  std::string & prefix, std::string & suffix, std::string & metadata) {
-        prepare_error_ = 4;
+        prepare_error_ = 4; input_error_ = vision_payload::InputError::none;
         if (vision_artifact::sealed_size(fd, record.bytes, caps_.source_bytes) != vision_artifact::Result::ok) return false;
         std::vector<unsigned char> source(size_t(record.bytes));
         for (size_t at = 0; at < source.size();) {
@@ -63,25 +68,19 @@ class Reader {
             at += size_t(n);
         }
         if (hash_sha256_hex(source.data(), source.size()) != record.id) return false;
-        int x = 0, y = 0, channels = 0;
-        // Header inspection BEFORE stbi_load or bitmap/preprocessor allocation.
-        // This admits the existing still-image decoder only, never audio/video.
-        prepare_error_ = 1;
-        if (!stbi_info_from_memory(source.data(), int(source.size()), &x, &y, &channels) || x <= 0 || y <= 0) return false;
-        prepare_error_ = 2;
-        if (uint32_t(x) > limits_.source_dimension || uint32_t(y) > limits_.source_dimension ||
-            uint64_t(x) > limits_.source_pixels / uint32_t(y)) return false;
-        const uint64_t pixels = uint64_t(x) * uint32_t(y);
-        if (pixels > (limits_.retained_rgb_bytes - rgb_) / 3) return false;
-        prepare_error_ = 1;
-        record.rgb = pixels * 3;
-        int decoded_x = 0, decoded_y = 0;
-        std::unique_ptr<unsigned char, decltype(&stbi_image_free)> decoded(
-            stbi_load_from_memory(source.data(), int(source.size()), &decoded_x, &decoded_y, &channels, 3), stbi_image_free);
-        if (!decoded || decoded_x != x || decoded_y != y) return false;
-        std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(mtmd_bitmap_init(x, y, decoded.get()), mtmd_bitmap_free);
+        if (rgb_ > limits_.retained_rgb_bytes || limits_.source_pixels > UINT64_MAX / vision_image::workspace_per_pixel) return false;
+        auto image = vision_image::decode(source.data(), source.size(), {limits_.source_dimension, limits_.source_pixels,
+            limits_.retained_rgb_bytes - rgb_, limits_.source_pixels * vision_image::workspace_per_pixel});
+        if (image.status == vision_image::Status::invalid_webp_header)
+            input_error_ = vision_payload::InputError::webp_header;
+        prepare_error_ = image.status == vision_image::Status::resource ? 2 :
+            image.status == vision_image::Status::unreadable ? 1 : 3;
+        if (image.status != vision_image::Status::ok) return false;
+        record.rgb = image.rgb.size();
+        std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(
+            mtmd_bitmap_init(int(image.width), int(image.height), image.rgb.data()), mtmd_bitmap_free);
         if (!bitmap) return false;
-        decoded.reset();
+        std::vector<unsigned char>().swap(image.rgb);
         mtmd_bitmap_set_id(bitmap.get(), record.id.c_str());
         const mtmd_bitmap * images[] = {bitmap.get()};
         record.chunks.reset(mtmd_input_chunks_init());
@@ -164,7 +163,7 @@ public:
             if (h.job != job_) {
                 if (h.kind != Kind::prepare || h.job <= job_) return 1;
                 for (const auto & record : records_) if (!record.released) return 1;
-                records_.clear(); job_ = h.job; sequence_ = 0; encoding_ = releasing_ = false; next_encode_ = 0;
+                records_.clear(); job_ = h.job; sequence_ = 0; encoding_ = releasing_ = false; next_encode_ = 0; last_prepare_ = UINT32_MAX;
             }
             if (sequence_ == UINT64_MAX || h.sequence != sequence_ + 1) return 1;
             sequence_ = h.sequence;
@@ -177,23 +176,35 @@ public:
             if (!cursor.equal(config_.generation) || !cursor.u32(occurrence) || !cursor.bytes(32, raw)) return 1;
             std::memcpy(digest.data(), raw.data(), digest.size());
             if (h.kind == Kind::prepare) {
-                Record record; record.source = digest; record.id = source_id(digest);
-                if (encoding_ || releasing_ || occurrence != records_.size() || occurrence >= caps_.occurrences ||
+                Record record; record.source = digest; record.id = source_id(digest); record.occurrence = occurrence;
+                // PR5 complete hits/duplicates do not create reader handles.
+                // Actual PREPAREs remain strictly ordered, but may be sparse.
+                if (encoding_ || releasing_ || (last_prepare_ != UINT32_MAX && occurrence <= last_prepare_) || occurrence >= caps_.occurrences ||
                     !cursor.u64(record.bytes) || next_handle_ == UINT64_MAX) return 1;
                 record.handle = ++next_handle_;
                 vision_payload::Binding binding{occurrence, digest, record.id, record.bytes, 0, 0, 0};
                 if (!vision_payload::validate(h.kind, payload, frame.fd_count, config_, caps_, binding, view)) return 1;
+                last_prepare_ = occurrence;
                 std::string prefix, suffix, metadata;
                 vision_commands::Prepared prepared;
                 if (!prepare(record, frame.fds[0], prepared, prefix, suffix, metadata)) {
+                    if (input_error_ != vision_payload::InputError::none) {
+                        // Header-only typed rejection has created no bitmap/chunks/GPU work.
+                        // No handle for this occurrence. Parent may omit a tool
+                        // occurrence or finalize; earlier handles remain owned.
+                        if (!send(Kind::input_rejected, job_, sequence_, binding, {}, 0, input_error_)) return 1;
+                        continue;
+                    }
                     (void)send(Kind::error, job_, sequence_, {}, {}, prepare_error_); return 1;
                 }
                 rgb_ += record.rgb; recipes_ += record.recipe_bytes;
                 if (!send(Kind::prepared, job_, sequence_, binding, prepared)) return 1;
                 records_.push_back(std::move(record));
             } else {
-                if (occurrence >= records_.size()) return 1;
-                auto & record = records_[occurrence];
+                const auto found = std::find_if(records_.begin(),records_.end(),
+                    [&](const Record & r) { return r.occurrence == occurrence; });
+                if (found == records_.end()) return 1;
+                auto & record = *found;
                 vision_payload::Binding binding{occurrence, record.source, record.id, record.bytes, record.handle, record.shape.x, record.shape.y};
                 if (!vision_payload::validate(h.kind, payload, frame.fd_count, config_, caps_, binding, view)) return 1;
                 if (h.kind == Kind::encode) {

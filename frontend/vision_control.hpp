@@ -1,4 +1,4 @@
-// CPU-only PR4 request/inbox foundations; not connected to the serving queue.
+// Owned native request controls and bounded serving-queue notifications.
 #pragma once
 #include <atomic>
 #include <chrono>
@@ -17,13 +17,14 @@ enum class Reason { none, disconnect, deadline, cancelled };
 class Request {
 public:
     explicit Request(Clock::time_point deadline) : deadline_(deadline) {}
+    virtual ~Request() = default;
     void cancel(Reason reason) noexcept {
         if (reason == Reason::none) return;
         Reason expected = Reason::none;
         reason_.compare_exchange_strong(expected, reason);
         stopped_.store(true);
     }
-    bool observe(Clock::time_point now = Clock::now()) noexcept {
+    virtual bool observe(Clock::time_point now = Clock::now()) noexcept {
         if (now >= deadline_) cancel(Reason::deadline);
         return stopped_.load();
     }

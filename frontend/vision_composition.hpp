@@ -5,6 +5,7 @@
 #include "vision_job_io.hpp"
 #include "vision_engine_handoff.hpp"
 #include "server-common.h"
+#include "vendor/hash/hash.h"
 #include <functional>
 #include <stdexcept>
 
@@ -18,9 +19,9 @@ inline server_tokens compose(const llama_vocab * vocab, const std::string & prom
     const vision_payload::Config & config, const vision_payload::Limits & caps, uint32_t max_cells,
     const std::function<llama_tokens(const std::string &)> & literal) {
     require(vocab && uint32_t(llama_vocab_n_tokens(vocab)) == config.vocabulary_size && !marker.empty() &&
-            !prepared.recipes.empty() && prepared.recipes.size() == image_ids.size() &&
+            prepared.recipes.size() == image_ids.size() &&
             image_ids.size() <= caps.occurrences && max_cells && max_cells <= uint32_t(INT32_MAX));
-    server_tokens out(llama_tokens{}, true);
+    server_tokens out(llama_tokens{}, !prepared.recipes.empty());
     uint64_t cells = 0, positions = 0;
     auto reserve = [&](uint64_t n, uint64_t p) {
         require(n <= max_cells - cells && p <= uint64_t(INT32_MAX) - positions); cells += n; positions += p;
@@ -64,7 +65,8 @@ inline server_tokens compose(const llama_vocab * vocab, const std::string & prom
     auto segment = [&](const std::string & s, bool add_bos, bool add_eos) {
         if (add_bos) token(llama_vocab_bos(vocab));
         size_t pos = 0;
-        for (size_t at = s.find(marker); at != std::string::npos; at = s.find(marker, pos)) {
+        for (size_t at = prepared.recipes.empty() ? std::string::npos : s.find(marker);
+             at != std::string::npos; at = s.find(marker, pos)) {
             text(s.substr(pos, at - pos)); image(); pos = at + marker.size();
         }
         text(s.substr(pos));
@@ -144,7 +146,10 @@ public:
                 auto chunk = prompt.find_chunk(at).get();
                 require(chunk && mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE &&
                         mtmd_input_chunk_get_n_tokens(chunk) == recipe.shape.cells &&
-                        row->tag().instance == identity.instance && row->tag().job == identity.job && row->tag().occurrence == occurrence &&
+                        row->tag().instance == identity.instance && row->tag().job == identity.job &&
+                        (encoded.prepared->source_occurrences.empty() ? row->tag().occurrence == occurrence :
+                         encoded.prepared->source_occurrences.size() == encoded.rows.size() &&
+                         row->tag().occurrence == encoded.prepared->source_occurrences[occurrence]) &&
                         row->bytes() == recipe.row_bytes && recipe.shape.cells <= prompt.size() - at);
                 size_t metadata_bytes = 0;
                 require(mtmd_input_chunk_save(chunk, nullptr, 0, &metadata_bytes) == 0 && metadata_bytes == recipe.metadata.size());
@@ -163,7 +168,9 @@ public:
                 }
                 file->ids.insert(file->ids.end(), recipe.shape.cells, image_pad);
                 const char * id = mtmd_input_chunk_get_id(chunk); require(id && *id);
-                keys.push_back(PictureCache::engine_key(id));
+                const auto identity_bytes = vision_cache::identity_bytes({encoded.prepared->config,row->tag().source});
+                const auto identity_hash = hash_sha256_hex(reinterpret_cast<const uint8_t *>(identity_bytes.data()),identity_bytes.size());
+                keys.push_back(PictureCache::engine_key(identity_hash));
                 at += recipe.shape.cells; ++occurrence;
             }
             require(occurrence == encoded.rows.size() && file->ids.size() == prompt.size() && file->ids.back() != image_pad);

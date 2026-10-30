@@ -2,6 +2,7 @@
 // single-device authority come from explicit runtime configuration.
 #pragma once
 #include "vision_composition.hpp"
+#include "vision_chat.hpp"
 #include "vision_engine_adapter.hpp"
 #include "server-queue.h"
 #include "vendor/hash/hash.h"
@@ -79,8 +80,12 @@ public:
         std::string prompt;
         std::vector<std::pair<size_t,size_t>> plain;
         std::vector<raw_buffer> sources;
+        std::shared_ptr<const vision_chat::Chat> chat;
         llama_tokens text; // already-tokenized parent text; no image placeholders
-        std::shared_ptr<vc::Request> control;
+        std::shared_ptr<vc::Request> control, work_control;
+        std::vector<vision_cache::Flights::Held> flights;
+        std::vector<vision_payload::Digest> digests;
+        std::vector<std::string> image_ids;
         std::shared_ptr<Ledger> ledger;
         size_t bytes = 0;
         ~Envelope() {
@@ -88,7 +93,11 @@ public:
             std::lock_guard<std::mutex> lock(ledger->mutex); --ledger->count; ledger->bytes -= bytes;
         }
     };
-    struct Prompt final : vision_engine_handoff::Resources { server_tokens tokens; std::shared_ptr<const Envelope> envelope; };
+    struct Prompt final : vision_engine_handoff::Resources {
+        server_tokens tokens;
+        std::shared_ptr<const Envelope> envelope;
+        json regenerated; // consumed by main queue before admission/engine start
+    };
     struct Notice {
         enum Kind { prompt, line, terminal } kind;
         io::Identity identity;
@@ -161,7 +170,8 @@ private:
     Worker worker_;
     std::shared_ptr<vision_artifact::Budget> artifacts_;
     std::shared_ptr<io::RecipeBudget> recipes_;
-    std::shared_ptr<vision_row_cache::Cache> cache_;
+    std::shared_ptr<vision_cache::Cache> cache_;
+    std::unique_ptr<vision_cache::Flights> flights_;
     bool cache_frozen_ = false; // lifecycle_mutex_; immutable after start/first enqueue
     std::mutex envelopes_mutex_;
     std::map<int,std::shared_ptr<Envelope>> envelopes_;
@@ -176,11 +186,21 @@ private:
     std::atomic<bool> available_{false}, stopping_{false}, exited_{false}, failure_latched_{false};
     static uint64_t task_id(int id) { return uint64_t(id) + 1; } // wire task zero is reserved
     bool same(io::Identity id) const { return active_ && id.task == identity_.task && id.instance == identity_.instance && id.job == identity_.job; }
-    bool cancelled() { return active_->control->observe() || stopping_; }
+    bool cancelled() {
+        // Reader work can outlive one disconnected waiter, but its engine turn
+        // cannot. Other waiters are bounded pending envelopes, not new GPU jobs.
+        const bool reader_phase = phase_ != Phase::file && phase_ != Phase::engine;
+        return (reader_phase && active_->work_control ? active_->work_control : active_->control)->observe() || stopping_;
+    }
     void fail(Error error) {
         error_ = stopping_ ? Error::unavailable : error;
-        if (handed_) active_->control->cancel(vc::Reason::cancelled);
-        else terminal_pending_ = true; // nothing could have reached a child
+        if (handed_) {
+            active_->control->cancel(vc::Reason::cancelled);
+            // Parent failure is not a waiter disconnect: this producer cannot
+            // proceed even if other interests remain. Cancel only its owned
+            // work control, never the other requests' controls.
+            if (active_->work_control) active_->work_control->cancel(vc::Reason::cancelled);
+        } else terminal_pending_ = true; // nothing could have reached a child
     }
     Notice finish() {
         auto control = active_->control;
@@ -219,13 +239,18 @@ public:
     bool set_cache(size_t entries, uint64_t bytes) {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         if (cache_frozen_ || stopping_ || (entries && !bytes)) return false;
-        cache_ = entries ? std::make_shared<vision_row_cache::Cache>(entries, bytes, artifacts_) : nullptr;
+        if (wire_.occurrences && limits_.pending_count > SIZE_MAX / wire_.occurrences) return false;
+        const auto waiters = limits_.pending_count * wire_.occurrences;
+        cache_ = entries ? std::make_shared<vision_cache::Cache>(entries, bytes, artifacts_,recipes_) : nullptr;
+        flights_ = entries ? std::make_unique<vision_cache::Flights>(waiters,waiters) : nullptr;
         return true;
     }
-    vision_row_cache::Cache::Stats cache_stats() {
+    vision_cache::Cache::Stats cache_stats() {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        return cache_ ? cache_->stats() : vision_row_cache::Cache::Stats{};
+        return cache_ ? cache_->stats() : vision_cache::Cache::Stats{};
     }
+    size_t pending_limit() const { return limits_.pending_bytes; }
+    size_t occurrence_limit() const { return wire_.occurrences; }
     bool available() const { return available_; }
     bool service_alive() const { std::lock_guard<std::mutex> lock(lifecycle_mutex_); return supervisor_ && !stopping_ && !supervisor_->failed_service() && supervisor_->state() != vs::State::safety_blocked && !engine_->stopped(); }
     bool service_failed() const { std::lock_guard<std::mutex> lock(lifecycle_mutex_); return failure_latched_ || (supervisor_ && supervisor_->failed_service()); }
@@ -253,14 +278,18 @@ public:
     // bytes plus count bounds; task options/tokenizer/RSS have separate gates.
     std::shared_ptr<vc::Request> enqueue(int task, const std::string & prompt,
         const std::vector<std::pair<size_t,size_t>> & plain, const std::vector<raw_buffer> & sources,
-        const llama_tokens & text = {}, Error * rejection = nullptr) {
+        const llama_tokens & text = {}, Error * rejection = nullptr,
+        std::shared_ptr<const vision_chat::Chat> chat = {}) {
         auto reject = [&](Error error) { if (rejection) *rejection = error; return std::shared_ptr<vc::Request>{}; };
         { std::lock_guard<std::mutex> lock(lifecycle_mutex_); cache_frozen_ = true; }
         if (stopping_) return reject(Error::unavailable);
         if (task < 0 || (!sources.empty() && !text.empty())) return reject(Error::invalid);
         if (sources.size() > wire_.occurrences || text.size() > limits_.prompt_cells) return reject(Error::resource);
         for (auto id : text) if (id < 0 || uint32_t(id) >= config_.vocabulary_size) return reject(Error::invalid);
-        size_t bytes = prompt.size();
+        if (chat && chat->count() != sources.size()) return reject(Error::invalid);
+        size_t bytes = chat ? chat->bytes() : 0;
+        if (bytes > limits_.pending_bytes || prompt.size() > limits_.pending_bytes-bytes) return reject(Error::resource);
+        bytes += prompt.size();
         if (bytes > limits_.pending_bytes || plain.size() > (limits_.pending_bytes - bytes) / sizeof(plain[0])) return reject(Error::resource);
         bytes += plain.size() * sizeof(plain[0]);
         if (text.size() > (limits_.pending_bytes - bytes) / sizeof(text[0])) return reject(Error::resource);
@@ -269,6 +298,9 @@ public:
             if (source.empty()) return reject(Error::invalid);
             if (source.size() > wire_.source_bytes || source.size() > 10*1024*1024 || source.size() > limits_.pending_bytes - bytes) return reject(Error::resource);
             bytes += source.size();
+            constexpr size_t identity_bytes = 32 + 64; // owned digest + metadata id
+            if (identity_bytes > limits_.pending_bytes - bytes) return reject(Error::resource);
+            bytes += identity_bytes;
         }
         auto envelope = std::make_shared<Envelope>();
         { std::lock_guard<std::mutex> lock(ledger_->mutex);
@@ -276,6 +308,22 @@ public:
           ++ledger_->count; ledger_->bytes += bytes; envelope->bytes = bytes; envelope->ledger = ledger_; }
         envelope->task = task; envelope->control = std::make_shared<vc::Request>(io::after(limits_.total));
         envelope->prompt = prompt; envelope->plain = plain; envelope->sources = sources; envelope->text = text;
+        envelope->chat = std::move(chat);
+        for (const auto & source : sources) {
+            const auto hex = hash_sha256_hex(source.data(),source.size()); vision_payload::Digest digest{};
+            auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+            for (size_t j = 0; j < digest.size(); ++j) digest[j] = uint8_t(16*digit(hex[2*j])+digit(hex[2*j+1]));
+            envelope->digests.push_back(digest);
+            // Preserve tokenizer-derived metadata IDs exactly. Engine-visible
+            // keys are separately namespaced at the SVE1 writer boundary.
+            envelope->image_ids.push_back(hex);
+            if (flights_) {
+                auto ticket = flights_->join({config_,digest},envelope->control);
+                if (!ticket) return reject(Error::resource);
+                envelope->flights.push_back(std::move(ticket));
+            }
+        }
+        if (!envelope->flights.empty()) envelope->work_control = std::make_shared<vision_cache::Interest>(envelope->flights);
         std::lock_guard<std::mutex> lock(envelopes_mutex_);
         if (stopping_ || !envelopes_.emplace(task, envelope).second) return reject(Error::unavailable);
         return envelope->control;
@@ -298,31 +346,39 @@ public:
           auto found = envelopes_.find(task); if (found == envelopes_.end()) return false;
           active_ = found->second; }
         identity_ = {task_id(task), supervisor_->instance(), next_job_ == UINT64_MAX ? 0 : ++next_job_}; phase_ = Phase::sources;
-        if (!identity_.job || (!available_ && !(active_->sources.empty() && supervisor_->text_available())) || stopping_) { fail(Error::unavailable); return true; }
+        const bool readerless = !available_ && supervisor_->text_available();
+        if (!identity_.job || (!available_ && !(readerless && (active_->sources.empty() || cache_))) || stopping_) { fail(Error::unavailable); return true; }
         if (cancelled()) { fail(Error::internal); return true; }
         auto envelope = active_; auto id = identity_;
-        if (!worker_.submit([this, envelope, id] {
+        if (!worker_.submit([this, envelope, id, readerless] {
             Result result{Result::sources, id};
             try {
                 auto s = std::make_unique<io::Submission>(); s->job = id.job; s->control = envelope->control;
                 s->artifacts = artifacts_; s->recipes = recipes_; s->cache = cache_;
+                s->flights = envelope->flights; s->work_control = envelope->work_control;
                 s->limits = limits_.job; s->snapshot_bytes = limits_.snapshot_bytes;
                 s->prepare = limits_.prepare; s->encode = limits_.encode; s->cleanup = limits_.cleanup;
-                s->text_only = envelope->sources.empty();
+                s->text_only = envelope->sources.empty(); s->complete_only = readerless && !s->text_only;
+                if (s->complete_only) for (size_t i = 0; i < envelope->digests.size(); ++i) {
+                    auto held = cache_->find({config_,envelope->digests[i]});
+                    if (!held) held = envelope->flights[i]->flight->result();
+                    if (!held) { result.error = Error::unavailable; return result; }
+                    // Pin BEFORE source admission can evict LRU ownership.
+                    envelope->flights[i]->flight->publish(std::move(held));
+                }
                 for (size_t i = 0; i < envelope->sources.size(); ++i) {
                     const auto & source = envelope->sources[i];
-                    const auto hex = hash_sha256_hex(source.data(), source.size()); vision_payload::Digest digest{};
-                    auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
-                    for (size_t j = 0; j < digest.size(); ++j) digest[j] = uint8_t(16*digit(hex[2*j]) + digit(hex[2*j+1]));
+                    const auto & digest = envelope->digests[i];
                     vision_artifact::Artifact::Ptr artifact;
                     vision_artifact::Result allocated;
                     do {
                         allocated = vision_artifact::Artifact::source(*artifacts_, {0,id.job,uint32_t(i),digest},
                             {reinterpret_cast<const char *>(source.data()), source.size()}, wire_.source_bytes,
-                            envelope->control->deadline(), envelope->control->flag(), artifact);
+                            std::min(io::after(limits_.prepare),envelope->control->deadline()),
+                            (envelope->work_control ? envelope->work_control : envelope->control)->flag(), artifact);
                     } while (allocated == vision_artifact::Result::budget && cache_ && cache_->evict_one());
                     if (allocated != vision_artifact::Result::ok) { result.error = Error::resource; return result; }
-                    s->inputs.push_back({artifact, hex});
+                    s->inputs.push_back({artifact, envelope->image_ids[i], envelope->chat && envelope->chat->tool(i)});
                 }
                 envelope->sources.clear(); result.submission = std::move(s);
             } catch (...) { result.error = Error::resource; }
@@ -330,6 +386,7 @@ public:
         })) fail(Error::internal);
         return true;
     }
+    void reject_prompt() { fail(Error::internal); } // schema failure: contain, never generate
     void admit(int32_t maximum, const std::string & header, bool accepted) {
         if (!active_ || !handed_ || !prompt_ || generated_ || phase_ != Phase::admission) std::terminate();
         if (!accepted) error_ = Error::context;
@@ -394,7 +451,17 @@ public:
                     Result result{Result::composed, id};
                     try {
                         auto composed = std::make_shared<Prompt>(); composed->envelope = envelope;
-                        if (prepared->recipes.empty()) composed->tokens = server_tokens(envelope->text, false);
+                        if (!prepared->omitted.empty()) {
+                            if (!envelope->chat) throw std::runtime_error("missing owned chat inputs");
+                            auto rebuilt = envelope->chat->render(prepared->omitted);
+                            std::vector<std::string> remaining;
+                            for (size_t i = 0; i < ids.size(); ++i)
+                                if (!std::binary_search(prepared->omitted.begin(),prepared->omitted.end(),uint32_t(i))) remaining.push_back(ids[i]);
+                            if (remaining != rebuilt.image_ids) throw std::runtime_error("regenerated source order mismatch");
+                            composed->regenerated = std::move(rebuilt.task_params);
+                            composed->tokens = vision_composition::compose(vocab_,rebuilt.prompt,rebuilt.plain,marker_,
+                                *prepared,remaining,config_,wire_,limits_.prompt_cells,literal_);
+                        } else if (prepared->recipes.empty()) composed->tokens = server_tokens(envelope->text, false);
                         else composed->tokens = vision_composition::compose(vocab_, envelope->prompt, envelope->plain, marker_,
                             *prepared, ids, config_, wire_, limits_.prompt_cells, literal_);
                         result.prompt = std::move(composed);
@@ -433,6 +500,7 @@ public:
                 auto terminal = supervisor_->terminal();
                 if (!terminal || !same(terminal->identity)) std::terminate();
                 if (terminal->timed_out) error_ = Error::deadline;
+                else if (terminal->input_failure && terminal->outcome == vision_job::Outcome::input_error) error_ = Error::invalid;
                 else if (terminal->error_class == 1) error_ = Error::invalid;
                 else if (terminal->error_class == 2) error_ = Error::resource;
                 else if (terminal->outcome != vision_job::Outcome::success && error_ == Error::none) error_ = Error::internal;

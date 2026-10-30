@@ -1,0 +1,14 @@
+fd58a7c7e8841a51e6fc8c90bbf0dc9ec8159929e52f276a2176f14090ccf55a  packages/libexif12_0.6.24-1ubuntu0.24.04.1_amd64.deb
+d068907b75eec127bf1ddc0915f6493d52961196f2d35d8c80c6a79ce72f6f55  packages/libexif-dev_0.6.24-1ubuntu0.24.04.1_amd64.deb
+f68b5b23bc8a1688fb787d2aed7e2cdf895a73022f6a5025e183162dac4500b2  packages/libjpeg-turbo8_2.1.5-2ubuntu2_amd64.deb
+839aec481a9f365c5f1a9e444975f4cc9e944843ff54a849b18161f5be9a963d  packages/libjpeg-turbo8-dev_2.1.5-2ubuntu2_amd64.deb
+4e1763494e5b9d34192313aa88e38201fc67b3f13ea96ca268d26401a3002791  packages/libsharpyuv0_1.3.2-0.4build3_amd64.deb
+c86f6439f0bbc531f7199794654231f3b29327d6585958511b958795d51c2484  packages/libwebp7_1.3.2-0.4build3_amd64.deb
+15e98f127e1fdbf0889cf4b2f5604b60a6da0b988f20bf34731c9a2307d490d6  packages/libwebpdemux2_1.3.2-0.4build3_amd64.deb
+7ba3a6f29d2656b89d5600322c959d6bc7841f1a88e1fa2770c60d639379effe  packages/libwebp-dev_1.3.2-0.4build3_amd64.deb
+0dd0f2de0fbbda7239209332ddfe512f4383d0489dd3f9fb25398f58c1621724  packages/libwebpmux3_1.3.2-0.4build3_amd64.deb
+88bd472e50a7e45469e31f8e0ba232b4d8ed30322f5badb285c58cc1ba0d2176  packages/libyuv0_0.0~git202401110.af6ac82-1_amd64.deb
+5294b471c869a03e5bff337cd5854fc631b481bd688a4000ebeb200ff05f819a  packages/libyuv-dev_0.0~git202401110.af6ac82-1_amd64.deb
+f2816ddbefe83c9cc99e30416ada7f21f93fa9be6e17eddb0e63a4326667142e  source/libexif_0.6.24-1ubuntu0.24.04.1.debian.tar.xz
+af56bbc19b74d405af0ad22578e3baa6756cbd55596392c5536f14d9fd681613  source/libexif_0.6.24-1ubuntu0.24.04.1.dsc
+d3fb7c47829ec4d2def39aa38f4c35a0891763448a05dbf216a329a12bf198f9  source/libexif_0.6.24.orig.tar.gz

@@ -8,6 +8,9 @@
 
 namespace strata_frontend::vision_payload {
 using Digest = std::array<uint8_t, 32>;
+// Deliberately narrow: generic stb/decoder failures are NOT input rejection.
+enum class InputError : uint32_t { none = 0, webp_header = 1 };
+struct InputFailure { uint32_t occurrence; InputError reason; };
 struct Config {
     Digest generation; // parent-derived hash including pin, model/vocabulary, projector, settings and limits
     std::array<uint8_t, 16> device;
@@ -28,6 +31,7 @@ struct Binding {
 struct View {
     uint64_t handle = 0, row_bytes = 0;
     uint32_t error_class = 0;
+    InputError input_error = InputError::none;
     vision_metadata::Shape shape{};
     std::string_view prefix_ids, suffix_ids, metadata; // IDs are u32 little endian, already vocab-checked
 };
@@ -90,7 +94,14 @@ inline bool validate(vision_protocol::Kind kind, std::string_view payload, size_
     } else {
         uint32_t occurrence;
         if (!c.u32(occurrence) || occurrence != binding.occurrence || occurrence >= limits.occurrences || !c.equal(binding.source)) return false;
-        if (kind == Kind::prepare) {
+        if (kind == Kind::input_rejected) {
+            uint64_t bytes;
+            uint32_t reason;
+            if (fd_count || !c.u64(bytes) || !bytes || bytes != binding.source_bytes ||
+                bytes > limits.source_bytes || bytes > 10 * 1024 * 1024 ||
+                !c.u32(reason) || reason != uint32_t(InputError::webp_header) || !c.empty()) return false;
+            pending.input_error = InputError(reason);
+        } else if (kind == Kind::prepare) {
             uint64_t bytes;
             if (fd_count != 1 || !c.u64(bytes) || !bytes || bytes != binding.source_bytes ||
                 bytes > limits.source_bytes || bytes > 10 * 1024 * 1024 || !c.empty()) return false;
