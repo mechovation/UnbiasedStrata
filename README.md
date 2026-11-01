@@ -124,7 +124,27 @@ with explicit finite resource/process limits and companion reader/guard executab
 **PR4 implementation, CPU/GPU acceptance and release review are complete** for the
 pinned backend and reviewed 5070 Ti profile. Legacy remains the default; deployment
 is a separate operator decision. See the [vision-stack implementation plan](docs/VISION_IMPLEMENTATION_PLAN.md).
-No early cache or synthetic encode warmup is included.
+The PR5 native path now caches complete tokenizer recipes and validated rows before
+reader preparation, with bounded single-flight and cancellation-safe ownership.
+GPU acceptance passed for the original Flash profile and the explicit frozen
+poly/whole-KV test policy, including static headroom and fresh encode after restart.
+Unfrozen poly remains disqualified.
+Legacy serving remains unchanged; no synthetic encode warmup is included.
+
+PR6 development now adds library-backed EXIF/WebP normalization inside the native
+reader, with CPU validation and policy/library-aware cache identity.
+Codec-specific CPU reader/projector fixtures pass.
+Typed WebP header rejection now omits unreadable tool
+images with a visible note and fresh owned-input prompt composition; user images
+remain errors. Ambiguous JPEG/PNG/decoder failures are still errors, not omissions.
+Real-engine/GPU qualification passed for the exact
+Flash/frozen-poly policies. Scoped security review and
+candidate codec distribution checks are recorded;
+omission coverage and release caveats remain open. No production activation is
+implied. See
+[dependency terms](third_party/vision-codecs/NOTICE.md). The detailed PR5/PR6 work
+records stay in the development workspace and are not published with this
+repository.
 
 **Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (`strata`; the two GGUF shards, the pack directory made from shard 1, the MTP
 draft directory). On the 24 GB card:

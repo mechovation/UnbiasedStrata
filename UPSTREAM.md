@@ -83,6 +83,45 @@ Recorded here because a client written for one of the two may notice.
   `--image-max-tokens` overrides). The encoder runs on the CPU: the front end's ggml is built without CUDA, and
   `--mmproj-gpu` is refused when ggml has no GPU device (17e27213). Measured in
   2026-10-18 on the A6000 (record in history at 7551f138).
+- **PR5 native early image cache** (`vision_cache.hpp`, `vision_recipe_budget.hpp`,
+  `vision_job{,_io}.hpp`, `vision_queue.hpp`, `vision_control.hpp`, `vision_supervisor.hpp`):
+  complete immutable tokenizer recipes and sealed rows are looked up by source SHA-256
+  plus the full PR4 configuration identity before PREPARE. Both ledgers follow held
+  references after eviction. Bounded source-flight tickets share results across queued
+  requests; reader work may finish for remaining waiters after a producer disconnect,
+  but engine generation always uses the original request control. Fully cached requests
+  can use a certified readerless turn; misses never trigger implicit recovery.
+  `vision_reader.cpp` accepts strictly ordered sparse occurrence IDs for skipped hits;
+  `vision_composition.hpp` versions emitted image keys independently of untouched
+  tokenizer metadata. No engine, SVE1 or IPC payload ABI changes, submodule update,
+  default activation or synthetic warmup.
+  `Makefile` adds the no-model cache/single-flight regressions to `make test`.
+  GPU-only qualification helpers under `frontend/tests/pr5-gpu-*` and
+  `vision-gpu-*` / `vision_gpu_fixtures.py` provide matched GPU row/token probes,
+  phase counts, controlled reply-held cancellation and maintenance restoration;
+  none is linked into shipped binaries. 44 paired projector cases and both real
+  engines passed, including full-KV readerless/restart/fresh-encode gates. Poly
+  qualification explicitly uses existing `STRATA_FREEZE_EXPERTS=1` plus `--kv-whole`;
+  `vision_runtime.hpp` narrowly admits only engine exact `"1"`, never reader or
+  `"0"`. The separate poly JSON test profile changes no other cap; Flash and
+  production settings are unchanged. Unfrozen poly remains disqualified for
+  readerless work. No engine source or reserve changes.
+- **PR6 native normalization (development)**: `vision_image.{hpp,cpp}` orchestrates
+  unmodified WebP/libexif/libyuv APIs only in the reader. Existing PNG alpha and
+  stb JPEG decoding are preserved; policy, host workspace allowance and shared
+  library file hashes enter runtime generation. CMake requires replaceable shared
+  codec libraries, with no downloads/patches. CPU normalizer and
+  codec-specific reader/projector fixtures passed;
+  typed WebP header rejection now supports role-aware
+  tool-image omission and fresh owned-input template/literal composition in the
+  same job. User images and ambiguous faults remain errors. Broader unreadable
+  input coverage remains open. Real-engine/GPU gates
+  passed for the exact Flash/frozen-poly policies; scoped security review
+  and candidate codec packaging checks are recorded,
+  with release caveats retained. No engine, reserve or production change.
+  See
+  [license obligations](third_party/vision-codecs/NOTICE.md). Detailed PR5/PR6 status
+  and qualification records stay in the development workspace and are not published.
 - **`--sse-ping-interval`** is llama-server's (default 30 s); the measured Flash-Next runs used 10.
 - **SIGTERM exits 1**, not 0, after stopping the engine: the engine child dies with the process group and the front
   end reports it as an engine death with an empty message. Open; matters only to a service manager.

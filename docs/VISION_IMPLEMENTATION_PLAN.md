@@ -1,6 +1,6 @@
 # Vision improvement implementation plan
 
-**Original planning snapshot; final PR4 status:** PR1–3 and Spike A are checkpointed. **PR4 implementation, CPU/GPU acceptance and release review are COMPLETE (2026-10-30)**. No PR4 gate remains open. Production is restored healthy; deployment/default activation is separate. **PR5 CPU/GPU acceptance passed for the original Flash profile and explicit frozen poly/whole-KV test policy**, including static readerless headroom and fresh encode after restart; unfrozen poly remains disqualified and production activation remains separate. See [PR5 scope/evidence](PR5_CACHE.md) and [GPU results](PR5_GPU_TEST_RESULTS.md). PR6 normalization, role-aware typed WebP-header omission and CPU/GPU qualification passed for the exact Flash/frozen-poly policies. [Scoped security review](PR6_SECURITY.md), [candidate codec distribution checks](PR6_DISTRIBUTION.md) and [durable GPU results](PR6_GPU_RESULTS.md) are recorded. Broader unreadable-input coverage remains explicitly open, with release caveats retained; full PR6 acceptance is not claimed. Resume from the [current PR6 checklist](PR6_HANDOFF.md). PR7 and deployment remain excluded. Historical planning milestones below are not current unfinished PR4 work.
+**Original planning snapshot; final PR4 status:** PR1–3 and Spike A are checkpointed. **PR4 implementation, CPU/GPU acceptance and release review are COMPLETE (2026-10-30)**. No PR4 gate remains open. Production is restored healthy; deployment/default activation is separate. **PR5 CPU/GPU acceptance passed for the original Flash profile and explicit frozen poly/whole-KV test policy**, including static readerless headroom and fresh encode after restart; unfrozen poly remains disqualified and production activation remains separate. See PR5 scope/evidence (PR5_CACHE.md, not published) and GPU results (PR5_GPU_TEST_RESULTS.md, not published). PR6 normalization, role-aware typed WebP-header omission and CPU/GPU qualification passed for the exact Flash/frozen-poly policies. Scoped security review (PR6_SECURITY.md, not published), candidate codec distribution checks (PR6_DISTRIBUTION.md, not published) and durable GPU results (PR6_GPU_RESULTS.md, not published) are recorded. Broader unreadable-input coverage remains explicitly open, with release caveats retained; full PR6 acceptance is not claimed. Resume from the current PR6 checklist (PR6_HANDOFF.md, not published). PR7 and deployment remain excluded. Historical planning milestones below are not current unfinished PR4 work.
 
 Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf60f0`, llama.cpp submodule `44072a19fb94d0bed63d381d42f6237373f91d54`. This is the technical execution plan, not a replacement for the [behavioral specification](VISION_STACK_REVIEW.md), [performance evidence](VISION_STACK_BENCHMARK.md), or [issue reproductions](VISION_ISSUE_VALIDATION.md).
 
@@ -252,19 +252,19 @@ Gate: counted warm hits perform zero worker preparation/encode calls; eviction a
 
 ## 9. PR6 — normalization and tool-result recovery
 
-Current slices: [library selection/license proof](PR6_CODEC_AUDIT.md) and
-[native-reader normalization CPU integration](PR6_NORMALIZATION.md) passed. Mandatory [dependency constraints](PR6_DEPENDENCY_POLICY.md): C++ or Rust,
+Current slices: library selection/license proof (PR6_CODEC_AUDIT.md, not published) and
+native-reader normalization CPU integration (PR6_NORMALIZATION.md, not published) passed. Mandatory dependency constraints (PR6_DEPENDENCY_POLICY.md, not published): C++ or Rust,
 no Python or bespoke codecs/parsers/transforms, compatible OSS terms and no library
-modifications. [Codec-specific CPU reader/projector fixtures](PR6_PROJECTOR_TESTS.md)
-now pass. [PR6D](PR6_INPUT_ERRORS.md) adds a narrow typed WebP header rejection
+modifications. Codec-specific CPU reader/projector fixtures (PR6_PROJECTOR_TESTS.md, not published)
+now pass. PR6D (PR6_INPUT_ERRORS.md, not published) adds a narrow typed WebP header rejection
 with safe request termination for user images and role-aware omission for tool
 images. Owned-input template/literal regeneration and repeated-history CPU tests
-are implemented; generic stb/decoder failures remain fatal. [Real-engine/GPU
-qualification](PR6_GPU_RESULTS.md) passed for the exact Flash/frozen-poly policies.
-[Scoped security review](PR6_SECURITY.md) and [candidate codec distribution
-checks](PR6_DISTRIBUTION.md) are recorded. Broader unreadable-input coverage stays
+are implemented; generic stb/decoder failures remain fatal. Real-engine/GPU
+qualification (PR6_GPU_RESULTS.md, not published) passed for the exact Flash/frozen-poly policies.
+Scoped security review (PR6_SECURITY.md, not published) and candidate codec distribution
+checks (PR6_DISTRIBUTION.md, not published) are recorded. Broader unreadable-input coverage stays
 open by explicit direction; vendor-triage/support caveats and final shipping-image
-verification remain release conditions. See the [current checklist](PR6_HANDOFF.md).
+verification remain release conditions. See the current checklist (PR6_HANDOFF.md, not published).
 
 Freeze one native worker-owned normalization path. Prefer established native codec/EXIF libraries; audit build/runtime dependencies before choosing them. Do not introduce Pillow, ffmpeg subprocess requirements by accident, or a general image framework without a size/security review.
 

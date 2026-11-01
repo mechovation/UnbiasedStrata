@@ -79,3 +79,14 @@ PolyStrata is open source under the [MIT License](../LICENSE). A few parts carry
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.
+
+The PR6 development frontend/reader additionally link unmodified WebP/libyuv
+(BSD-3-Clause plus patent terms), shared libexif (LGPL obligations), and their
+reviewed dependencies including libjpeg-turbo (IJG/BSD/zlib terms). These are not
+relicensed as MIT. See [third-party notices and source/replacement requirements](../third_party/vision-codecs/NOTICE.md).
+Candidate codec packaging/source/replacement checks and
+scoped security review are recorded; a future shipping image
+still needs final artifact verification. GPU gates passed
+for the qualified profiles. Full PR6 acceptance remains open; the detailed PR4/PR5/PR6
+work records stay in the development workspace and are not published with this
+repository.
