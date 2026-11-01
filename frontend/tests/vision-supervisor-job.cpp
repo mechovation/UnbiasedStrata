@@ -342,7 +342,7 @@ static void scenario(const char * executable, const char * guard, const std::str
     assert(budget->usage().bytes == 0 && budget->usage().artifacts == 0 && fd_count() == baseline);
     events.inbox->stop_accepting(); assert(events.inbox->settled());
 }
-#include "pr6-input-rejection.inc"
+#include "input-rejection-tests.inc"
 #include "vision-supervisor-engine.inc"
 #include "vision-engine-adapter.inc"
 int main(int argc, char ** argv) {

@@ -26,7 +26,7 @@ Provenance:
 | 8 | 333×197 | 1024 | 10×6 |
 | 9 | 2048×1024 | 1024 | 45×22 |
 
-Files 0–3 intentionally match 5–8: the larger token cap does not change those images. `SHA256SUMS` is verified by `pr4-foundations.sh`. The baseline tests need neither models nor mtmd libraries. All injected numeric caps are test values, not production budget approval.
+Files 0–3 intentionally match 5–8: the larger token cap does not change those images. `SHA256SUMS` is verified by `native-reader-foundations.sh`. The baseline tests need neither models nor mtmd libraries. All injected numeric caps are test values, not production budget approval.
 
 Regeneration in an isolated CPU-only environment with existing assets:
 

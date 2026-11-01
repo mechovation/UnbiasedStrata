@@ -195,7 +195,7 @@ static int native_engine(const char * gate = nullptr) {
 }
 #include "vision-native-queue.inc"
 #include "vision-native-cache.inc"
-#include "pr6-reader-codecs.inc"
+#include "reader-codec-tests.inc"
 int main(int argc, char ** argv) {
     if ((argc == 2 || argc == 3) && std::string(argv[1]) == "engine") return native_engine(argc == 3 ? argv[2] : nullptr);
     const bool reader = argc == 6 && std::string(argv[1]) == "reader";

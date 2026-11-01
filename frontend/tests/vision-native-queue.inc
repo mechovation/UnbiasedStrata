@@ -1,6 +1,6 @@
 // Included by vision-native.cpp: actual request handler, server_queue, slot and
 // response reader. All decoder/encoder work remains in the real reader child.
-#include "pr6-codec-fixtures.hpp"
+#include "codec-test-fixtures.hpp"
 static void queue_scenario(const char * executable, const char * guard, const char * model_path, const char * projector_path,
     const vision_payload::Config & config, const vision_payload::Limits & caps, const llama_vocab * vocab, int32_t pad,
     const std::string & prompt, const std::vector<std::pair<size_t,size_t>> & plain, const std::vector<raw_buffer> & sources,
