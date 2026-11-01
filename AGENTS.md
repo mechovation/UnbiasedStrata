@@ -15,3 +15,8 @@
   Do not use a build to initiate large image downloads. Use the existing hf-download
   container for any needed background Hugging Face downloads.
 - Keep API keys out of source, images, logs, and command-line arguments.
+
+# Reply length
+
+- Keep chat replies under ~100 words. Put findings, evidence and citations in files
+  and name the path. No tables or long quotes in chat.

@@ -1,6 +1,6 @@
 # Vision improvement implementation plan
 
-**Original planning snapshot; final PR4 status:** PR1–3 and Spike A are checkpointed. **PR4 implementation, CPU/GPU acceptance and release review are COMPLETE (2026-10-30)**. No PR4 gate remains open. Production is restored healthy; deployment/default activation is separate. PR5–7 remain excluded. Historical planning milestones below are not current unfinished PR4 work.
+**Original planning snapshot; final PR4 status:** PR1–3 and Spike A are checkpointed. **PR4 implementation, CPU/GPU acceptance and release review are COMPLETE (2026-10-30)**. No PR4 gate remains open. Production is restored healthy; deployment/default activation is separate. **PR5 CPU/GPU acceptance passed for the original Flash profile and explicit frozen poly/whole-KV test policy**, including static readerless headroom and fresh encode after restart; unfrozen poly remains disqualified and production activation remains separate. See [PR5 scope/evidence](PR5_CACHE.md) and [GPU results](PR5_GPU_TEST_RESULTS.md). PR6 normalization, role-aware typed WebP-header omission and CPU/GPU qualification passed for the exact Flash/frozen-poly policies. [Scoped security review](PR6_SECURITY.md), [candidate codec distribution checks](PR6_DISTRIBUTION.md) and [durable GPU results](PR6_GPU_RESULTS.md) are recorded. Broader unreadable-input coverage remains explicitly open, with release caveats retained; full PR6 acceptance is not claimed. Resume from the [current PR6 checklist](PR6_HANDOFF.md). PR7 and deployment remain excluded. Historical planning milestones below are not current unfinished PR4 work.
 
 Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf60f0`, llama.cpp submodule `44072a19fb94d0bed63d381d42f6237373f91d54`. This is the technical execution plan, not a replacement for the [behavioral specification](VISION_STACK_REVIEW.md), [performance evidence](VISION_STACK_BENCHMARK.md), or [issue reproductions](VISION_ISSUE_VALIDATION.md).
 
@@ -13,7 +13,7 @@ Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf
 - **C++/CUDA serving end to end.** No Python interpreter, server, encoder worker, runtime package or Python implementation port. Existing external Python test clients/fake fixtures are development tools only.
 - Preserve the pinned llama.cpp parser/template/tokenizer and literal-token protections. No dependency updates, downloaded replacement components, or silent build-time patching.
 - Keep existing engine `GEN`/`GENI` and SVE1 transport initially. Do not combine this work with new model families, a new engine, multi-GPU, elasticity, persistent image caching or zero-copy protocols.
-- Do not fork from a CUDA-initialized/multithreaded parent to launch/restart native workers. Use clean exec-based creation, preferably `posix_spawn`, for the future reader and eventually the engine launch.
+- Do not fork from a CUDA-initialized/multithreaded parent to launch/restart native processes. Clean exec-based creation via `posix_spawn` is the shipped mechanism (`frontend/clean_process.hpp`) and covers both the reader and the engine launch; with native vision enabled the legacy engine fork path is rejected (`frontend/strata_context.cpp:1435`).
 - First fixes must not depend on the later worker/cache redesign.
 - Startup image warmup is a **confirmed plan item, not an approved implementation**. Do not add its encode, change readiness, or change production launch settings in PR1.
 
@@ -37,7 +37,7 @@ Prepared 2026-10-29 against UnbiasedStrata `22abfdb87f3465a43ce1e2b2269a462bc3cf
 | **PR4** | Clean process launcher + supervised native reader, two-phase jobs, cancellation/deadlines | PR1 + Spike A; separate review of IPC and lifetime contracts |
 | **PR5** | Early metadata/row cache + bounded single-flight | PR4 + recipe parity; keep existing row-cache ownership guarantees |
 | **PR6** | Native EXIF/WebP normalization + tool-result omission | Worker-owned decode preferred; freeze codec/dependency/normalization policy |
-| **PR7** | Explicit startup encode and coordinated readiness/VRAM qualification | Separate authorization; native worker lifecycle established |
+| **PR7** | Explicit startup encode and coordinated readiness/VRAM qualification | Separate authorization; native reader lifecycle established in PR4 (`frontend/vision_supervisor.hpp`) |
 
 PR3 and Spike A may be prepared independently after PR1/PR2 review. PR6 may be split into smaller codec and tool-history PRs, but should use one normalization path rather than temporary duplicate decoders. Do not turn one PR into all seven phases.
 
@@ -166,7 +166,7 @@ Per-image composition may fail for prompt-dependent image indexing, alignment, t
 
 One resident **C++/CUDA child**, one supervisor/IPC owner, one active vision turn; preserve the existing HTTP server and text-engine transport. No Python worker, worker pool, persistent cache, elasticity or shared-memory optimization initially.
 
-**Tentative new native units:** `frontend/vision_worker.cpp`, `vision_protocol.hpp`, `vision_supervisor.{hpp,cpp}`, `vision_request.hpp`, and shared clean-process-launch support. Names/layout may be adjusted during review; these are not existing APIs.
+**Shipped native units (PR4 complete 2026-10-30):** the resident child is `frontend/vision_reader.cpp` with the standalone entry point `frontend/vision_reader_main.cpp`; the supervisor/IPC owner is `frontend/vision_supervisor.hpp` (header-only, no separate translation unit); request/cancellation objects are in `frontend/vision_control.hpp` and job/recipe/ticket types in `frontend/vision_job.hpp`; bounded framing is `frontend/vision_protocol.hpp`; process creation is `frontend/clean_process.hpp`. The originally planned `frontend/vision_worker.cpp` and `frontend/vision_request.hpp` were never created — do not implement them. Contracts and evidence are the local PR4 records under `docs/` (`PR4_*.md`), which are kept out of the public repository; `docs/PR6_STATUS.md` is the published status document. The same applies to the `PR5_*` and `PR6_*` records cited throughout this plan: they are local working documents, not published files.
 
 ### Ownership and request states
 
@@ -192,9 +192,9 @@ Main-queue states can be `IDLE / PREPARING / ENCODING / ENGINE_ACTIVE / DRAINING
 
 **GPU exclusion:** initially serialize worker preparation/encoding with the text engine's active turn. Do not launch GPU inference from HTTP handlers while the engine is decoding. More CPU-only overlap is a later optimization requiring proof that preparation is GPU-quiescent.
 
-### Two-phase IPC contract to freeze
+### Two-phase IPC contract (frozen in PR4)
 
-Use versioned bounded framing, job IDs, worker-instance IDs and explicit error categories. Proposed operations:
+Versioned bounded framing, job IDs, worker-instance IDs and explicit error categories are implemented in `frontend/vision_protocol.hpp`. Shipped operations (the `Kind` enumeration at `frontend/vision_protocol.hpp:9` also adds paired completions for `prepared`/`encoded`/`released` plus `error` and `input_rejected` replies):
 
 ```text
 READY(capabilities, config_generation, budgets)
@@ -221,9 +221,11 @@ QUIT
 
 ### Process launch/startup
 
-Prefer a shared `posix_spawn` launcher with explicit file actions, descriptor closing, environment filtering and no shell. Review engine-adapter start/stop parity before switching `Engine::start`; do not reuse its current fork-after-no-threads assumption for runtime restart.
+Shipped launcher: `frontend/clean_process.hpp` — `clean_spawn` (`:49`) and `protected_spawn` with parent-death protection (`:127`), using explicit file actions, `posix_spawn_file_actions_addclosefrom_np` descriptor closing, an explicit environment array and no shell or `PATH` search.
 
-Future ordering: establish GPU mask → clean-spawn reader → reader load/approved warmup → reader READY → clean-spawn engine → engine READY → global ready. Parent GPU allocation should be avoided/verified, but clean exec must not rely on an assumption that backend enumeration never initializes CUDA.
+Engine-adapter start/stop parity is settled, not pending: `Engine::start` already spawns through `protected_spawn` (`frontend/vision_engine_adapter.hpp:262`), and the native path forbids the legacy fork (`frontend/strata_context.cpp:1435`).
+
+Reader-then-engine ordering is implemented rather than future — `frontend/vision_supervisor.hpp:34` (`initialize_engine`), `:386` (reader spawn), `:403-405` (reader READY → engine initialize): establish GPU mask → clean-spawn reader → reader load (graph/buffer reservation; the PR7 representative encode is not implemented) → reader READY → clean-spawn engine → engine READY → global ready. Parent GPU allocation should be avoided/verified, but clean exec must not rely on an assumption that backend enumeration never initializes CUDA.
 
 Keep **explicit synthetic warmup disabled/unimplemented until PR7 is separately approved**; do not hide that change inside worker integration. Existing backend warmup behavior and the new representative encode are distinct.
 
@@ -249,6 +251,20 @@ Keep initial HTTP/SSE error semantics explicit. Sending headers early for queued
 Gate: counted warm hits perform zero worker preparation/encode calls; eviction and concurrent cancellation never invalidate held rows; config changes miss; repeated/mixed ordering and literal-token parity remain exact. Keep request SVE1 files alive until engine completion/drain. Both old servers still transfer rows on hits; removing that shared cost needs a later engine protocol proposal.
 
 ## 9. PR6 — normalization and tool-result recovery
+
+Current slices: [library selection/license proof](PR6_CODEC_AUDIT.md) and
+[native-reader normalization CPU integration](PR6_NORMALIZATION.md) passed. Mandatory [dependency constraints](PR6_DEPENDENCY_POLICY.md): C++ or Rust,
+no Python or bespoke codecs/parsers/transforms, compatible OSS terms and no library
+modifications. [Codec-specific CPU reader/projector fixtures](PR6_PROJECTOR_TESTS.md)
+now pass. [PR6D](PR6_INPUT_ERRORS.md) adds a narrow typed WebP header rejection
+with safe request termination for user images and role-aware omission for tool
+images. Owned-input template/literal regeneration and repeated-history CPU tests
+are implemented; generic stb/decoder failures remain fatal. [Real-engine/GPU
+qualification](PR6_GPU_RESULTS.md) passed for the exact Flash/frozen-poly policies.
+[Scoped security review](PR6_SECURITY.md) and [candidate codec distribution
+checks](PR6_DISTRIBUTION.md) are recorded. Broader unreadable-input coverage stays
+open by explicit direction; vendor-triage/support caveats and final shipping-image
+verification remain release conditions. See the [current checklist](PR6_HANDOFF.md).
 
 Freeze one native worker-owned normalization path. Prefer established native codec/EXIF libraries; audit build/runtime dependencies before choosing them. Do not introduce Pillow, ffmpeg subprocess requirements by accident, or a general image framework without a size/security review.
 
