@@ -1,4 +1,4 @@
-# Native vision checkpoint: PR6 status
+# Native vision status: reader, row cache, normalization
 
 **2026-10-30 — implementation checkpoint, not full PR6 release approval.**
 This is the single PR6 status document included with this push. PR5/PR6 tests,

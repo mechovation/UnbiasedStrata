@@ -5,7 +5,7 @@ normalizer tests. The frontend also links them for configuration identity, not
 image decoding. The development build targets now depend on them, but no
 production image has been updated or approved for distribution. An offline
 candidate bundle now packages and tests the codec-specific obligations; see
-[checkpoint status](../../docs/PR6_STATUS.md). Unrestricted release approval
+[checkpoint status](../../docs/vision-native-status.md). Unrestricted release approval
 is not implied. No library implementation is vendored here; this directory contains
 attribution, verbatim license records and artifact hashes.
 
@@ -49,7 +49,7 @@ offer. Test notices, source completeness, shared linkage and replacement support
 in actual release/container packaging before claiming distribution compliance.
 No production image or release package was changed during this development work.
 
-See the single published [PR6 status summary](../../docs/PR6_STATUS.md) for
+See the single published [native vision status summary](../../docs/vision-native-status.md) for
 implemented behavior, qualification and remaining conditions. Detailed PR5/PR6
 working documents and tests are intentionally not included in this checkpoint.
 Real-engine/GPU and candidate codec-compliance gates passed for the exact tested
