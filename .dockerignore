@@ -1,0 +1,6 @@
+.git
+build*
+secrets
+.env
+*.log
+third_party/llama.cpp/.git
