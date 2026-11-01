@@ -17,13 +17,13 @@ static auto deadline() { return wire::Clock::now() + 2s; }
 static void u32(std::string & s, uint32_t n) { for (unsigned i = 0; i < 4; ++i) s += char(n >> (8 * i)); }
 static void u64(std::string & s, uint64_t n) { for (unsigned i = 0; i < 8; ++i) s += char(n >> (8 * i)); }
 static va::Tag tag(uint32_t occurrence) { return {7, 11, occurrence, {}}; }
-static std::unique_ptr<vj::Job> job(va::Budget & budget, unsigned occurrences = 2, vj::Limits limits = {8192, 4096, 4096}) {
+static std::unique_ptr<vj::Job> job(va::Budget & budget, unsigned occurrences = 2, vj::Limits limits = {8192, 4096, 4096}, bool tool = false) {
     std::vector<vj::Input> inputs;
     for (unsigned i = 0; i < occurrences; ++i) {
         va::Artifact::Ptr source;
         auto source_tag = tag(i); source_tag.instance = 0;
         assert(va::Artifact::source(budget, source_tag, "source", 1024, deadline(), cancel, source) == va::Result::ok);
-        inputs.push_back({std::move(source), "pr4-fixture"});
+        inputs.push_back({std::move(source), "pr4-fixture", tool});
     }
     auto result = vj::Job::create(config, caps, limits, 7, 11, std::move(inputs)); assert(result);
     return result;
@@ -31,7 +31,9 @@ static std::unique_ptr<vj::Job> job(va::Budget & budget, unsigned occurrences = 
 static wire::Frame reply(vj::Ticket t, wire::Kind kind, uint64_t handle = 0) {
     std::string p(32, '\0');
     if (kind == wire::Kind::error) u32(p, 3);
-    else {
+    else if (kind == wire::Kind::input_rejected) {
+        u32(p,t.occurrence); p.append(32,'\0'); u64(p,6); u32(p,uint32_t(vp::InputError::webp_header));
+    } else {
         u32(p, t.occurrence); p.append(32, '\0'); u64(p, handle ? handle : t.handle);
         if (kind == wire::Kind::prepared) {
             u32(p, 7); u32(p, 7); u32(p, config.width);
@@ -219,6 +221,85 @@ int main() {
             cancel = false; assert(!j->prepare());
         }
         assert(!j->take_terminal() && !j->reader_stopped(false) && j->reader_stopped(true));
+    }
+    // Typed rejection stops PREPARE without a handle for the bad occurrence.
+    // Earlier handles must drain before a once-only typed terminal is available.
+    for (unsigned earlier : {0u,1u}) {
+        auto j = job(budget);
+        if (earlier) {
+            auto t = j->prepare(); auto f = reply(*t,wire::Kind::prepared,100);
+            assert(j->accept(f,deadline(),cancel) == vj::Reply::accepted);
+        }
+        auto t = j->prepare(); auto f = reply(*t,wire::Kind::input_rejected);
+        assert(j->accept(f,deadline(),cancel) == vj::Reply::input_error && !j->pending());
+        assert(j->phase() == vj::Phase::finalizing && !j->prepare() && !j->admit(true) && !j->engine_start_requested());
+        assert(j->input_failure()->occurrence == earlier && j->input_failure()->reason == vp::InputError::webp_header);
+        assert(!j->recipe(earlier) && !j->take_terminal() && budget.usage().bytes);
+        release_all(*j);
+        assert(j->take_terminal() == vj::Outcome::input_error && !j->take_terminal());
+        assert(budget.usage().bytes == 0);
+    }
+    // Generic errors, malformed typed replies, deadline/cancel and cleanup faults
+    // never become input-error terminals, even after an earlier typed rejection.
+    for (int fault = 0; fault < 7; ++fault) {
+        auto j = job(budget);
+        auto t = j->prepare(); auto good = reply(*t,wire::Kind::prepared,100);
+        assert(j->accept(good,deadline(),cancel) == vj::Reply::accepted);
+        t = j->prepare(); auto f = reply(*t,wire::Kind::input_rejected);
+        if (fault == 0) f.payload.back() = 1; // unknown reason (high byte)
+        if (fault == 1) f.payload[32] = 0; // wrong occurrence
+        if (fault == 2) cancel = true;
+        const auto result = j->accept(f,fault == 3 ? wire::Clock::now() : deadline(),cancel);
+        cancel = false;
+        if (fault < 4) assert(result == (fault == 2 ? vj::Reply::cancelled : vj::Reply::invalid));
+        else {
+            assert(result == vj::Reply::input_error);
+            auto release = j->release(); assert(release && release->occurrence == 0);
+            auto cleanup = reply(*release,fault == 4 ? wire::Kind::error : wire::Kind::released);
+            if (fault == 6) cancel = true;
+            const auto rc = j->accept(cleanup,fault == 5 ? wire::Clock::now() : deadline(),cancel);
+            cancel = false;
+            if (fault == 6) {
+                assert(rc == vj::Reply::accepted); release_all(*j);
+                assert(j->take_terminal() == vj::Outcome::cancelled); continue;
+            }
+            assert(rc == (fault == 4 ? vj::Reply::remote_error : vj::Reply::invalid));
+        }
+        assert(!j->take_terminal() && j->reader_stopped(true));
+        assert(j->take_terminal() != vj::Outcome::input_error && budget.usage().bytes == 0);
+    }
+    // Role-authorized typed omissions keep the SAME job, skip only rejected
+    // occurrences, and retain handles/rows for surviving inputs in original order.
+    for (unsigned mask : {1u,2u,3u}) {
+        auto j = job(budget,2,{8192,4096,4096},true);
+        for (unsigned i = 0; i < 2; ++i) {
+            auto t = j->prepare(); assert(t && t->occurrence == i);
+            auto f = reply(*t,(mask & (1u<<i)) ? wire::Kind::input_rejected : wire::Kind::prepared,100+i);
+            assert(j->accept(f,deadline(),cancel) == vj::Reply::accepted && !j->input_failure());
+            assert(j->omitted(i) == bool(mask & (1u<<i)));
+        }
+        assert(j->admit(true));
+        for (unsigned i = 0; i < 2; ++i) if (!(mask & (1u<<i))) {
+            auto t = j->encode(output(budget,i)); assert(t && t->occurrence == i);
+            auto f = reply(*t,wire::Kind::encoded); assert(j->accept(f,deadline(),cancel) == vj::Reply::accepted);
+        }
+        assert(j->phase() == vj::Phase::ready_for_engine && j->abandon_engine()); release_all(*j);
+        assert(j->take_terminal() == vj::Outcome::cancelled && budget.usage().bytes == 0);
+    }
+    {
+        auto j = job(budget,2,{8192,4096,4096},true);
+        auto t = j->prepare(); auto f = reply(*t,wire::Kind::input_rejected);
+        assert(j->accept(f,deadline(),cancel) == vj::Reply::accepted);
+        t = j->prepare(); f = reply(*t,wire::Kind::error);
+        assert(j->accept(f,deadline(),cancel) == vj::Reply::remote_error && !j->take_terminal());
+        assert(j->reader_stopped(true) && j->take_terminal() == vj::Outcome::failure);
+    }
+    // A typed rejection is never an ENCODE reply.
+    {
+        auto j = job(budget,1); prepare_all(*j); assert(j->admit(true));
+        auto t = j->encode(output(budget,0)); auto f = reply(*t,wire::Kind::input_rejected);
+        assert(j->accept(f,deadline(),cancel) == vj::Reply::invalid && j->reader_stopped(true));
+        assert(j->take_terminal() == vj::Outcome::failure);
     }
     assert(budget.usage().bytes == 0 && budget.usage().artifacts == 0);
     std::cout << "vision job ownership: PASS\n";

@@ -36,6 +36,8 @@ extern "C" unsigned char * __real_stbi_load_from_memory(const unsigned char *, i
 extern "C" unsigned char * __wrap_stbi_load_from_memory(const unsigned char * data, int bytes, int * x, int * y, int * channels, int wanted) {
     const char * path = std::getenv("PR4_NATIVE_COUNTER");
     if (path) { std::ofstream f(path, std::ios::app); f << 'D'; f.flush(); assert(f.good()); }
+    const char * hold = std::getenv("PR5_NATIVE_DECODE_HOLD");
+    while (hold && ::access(hold,F_OK) == 0) std::this_thread::sleep_for(10ms);
     return __real_stbi_load_from_memory(data, bytes, x, y, channels, wanted);
 }
 extern "C" char * __real_mkdtemp(char *);
@@ -157,6 +159,14 @@ static int native_engine(const char * gate = nullptr) {
             ++images;
         }
         assert(images == 3);
+        if (const char * capture = std::getenv("PR5_NATIVE_SIGNATURE")) {
+            std::ifstream sve(path,std::ios::binary);
+            std::string bytes = keys + "|" + pad + "|" + tokens + "|";
+            bytes.append(std::istreambuf_iterator<char>(sve),{});
+            std::ofstream signature(capture,std::ios::app);
+            signature << hash_sha256_hex(reinterpret_cast<const uint8_t *>(bytes.data()),bytes.size()) << '\n';
+            assert(signature.good()); // exact IDs, keys, ordered SVE1 header/row bytes
+        }
         }
         if (const char * path = std::getenv("PR4_NATIVE_COUNTER")) { std::ofstream f(path,std::ios::app); f << 'G'; f.flush(); assert(f.good()); }
         if (gate && !requests++) {
@@ -185,11 +195,13 @@ static int native_engine(const char * gate = nullptr) {
 }
 #include "vision-native-queue.inc"
 #include "vision-native-cache.inc"
+#include "pr6-reader-codecs.inc"
 int main(int argc, char ** argv) {
     if ((argc == 2 || argc == 3) && std::string(argv[1]) == "engine") return native_engine(argc == 3 ? argv[2] : nullptr);
     const bool reader = argc == 6 && std::string(argv[1]) == "reader";
-    assert(reader || argc == 4); // model, projector, guard
-    const char * model_path = argv[reader ? 2 : 1], * projector_path = argv[reader ? 3 : 2];
+    const bool codecs = argc == 5 && std::string(argv[1]) == "--codecs";
+    assert(reader || codecs || argc == 4); // model, projector, guard
+    const char * model_path = argv[reader || codecs ? 2 : 1], * projector_path = argv[reader || codecs ? 3 : 2];
     assert(!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
     auto mp = llama_model_default_params(); mp.vocab_only = true; mp.n_gpu_layers = 0;
     auto * model = llama_model_load_from_file(model_path, mp); assert(model);
@@ -199,6 +211,10 @@ int main(int argc, char ** argv) {
         auto * ctx = mtmd_init_from_file(projector_path, model, cp); assert(ctx);
         auto rc = vision_reader::serve(ctx, config, caps, {4096, 16*1024*1024, 48*1024*1024, 65536, 180s}, std::stoull(argv[5]), 3);
         mtmd_free(ctx); llama_model_free(model); return rc;
+    }
+    if (codecs) {
+        pr6_reader_codecs::run(argv[0],argv[4],model_path,projector_path,model,config,caps);
+        llama_model_free(model); return 0;
     }
     // Oracle projector exists only before the supervised request starts.
     strata_context_impl oracle; oracle.model = model; oracle.vocab = llama_model_get_vocab(model); oracle.init_literals();
@@ -288,7 +304,14 @@ int main(int argc, char ** argv) {
                     const auto path = file->path();
                     const std::string header = "GENI 1 img_keys=" + file->keys + " image_pad=" + std::to_string(oracle.image_pad_id) + " " + path;
                     server_task task; task.params.sampling.temp = 0;
-                    std::vector<uint64_t> engine_keys; for (const auto & image_id : ids) engine_keys.push_back(PictureCache::engine_key(image_id));
+                    std::vector<uint64_t> engine_keys;
+                    for (const auto & source : sources) {
+                        const auto bytes = vision_cache::identity_bytes({config,digest(source)});
+                        const auto key = PictureCache::engine_key(hash_sha256_hex(reinterpret_cast<const uint8_t *>(bytes.data()),bytes.size()));
+                        assert(key != PictureCache::engine_key(hash_sha256_hex(source.data(),source.size())));
+                        engine_keys.push_back(key);
+                    }
+                    assert(engine_keys[0] == engine_keys[2] && engine_keys[0] != engine_keys[1]);
                     assert(header == oracle.gen_header(task, 1, path, engine_keys));
                     auto resources = ea::Request::create({id.task,id.instance,id.job,1}, header, file->ids, engine_caps, file); assert(resources);
                     assert(supervisor.generate(id, resources, 10s, 5s)); resources.reset(); file.reset();
@@ -330,7 +353,7 @@ int main(int argc, char ** argv) {
     events.take(vc::Event::Kind::stopped, 0);
     assert(engine->stopped() && !safety->revoked && !safety->leased);
     assert(artifacts->usage().bytes == 0 && recipes->usage().bytes == 0);
-    queue_scenario(argv[0],argv[3],model_path,projector_path,config,caps,oracle.vocab,oracle.image_pad_id,prompt,spans,sources);
+    queue_scenario(argv[0],argv[3],model_path,projector_path,config,caps,oracle.vocab,oracle.image_pad_id,prompt,spans,sources,oracle.chat_params);
     queue_cache_scenario(argv[0],argv[3],model_path,projector_path,config,caps,oracle.vocab,oracle.image_pad_id,prompt,spans,sources);
     ::unlink(counter.c_str()); oracle.chat_params.tmpls.reset(); oracle.model = nullptr; llama_model_free(model);
     std::cout << "PR4_NATIVE_PASS real_reader=1 real_rows=1 prompt_parity=1 sve1_geni=1 context_refusal=1 encode_cancel=1 explicit_recovery=1 predecode_refusal=1 gpu=none queue=integrated\n";

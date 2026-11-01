@@ -1,8 +1,10 @@
 // Included by vision-native.cpp: actual request handler, server_queue, slot and
 // response reader. All decoder/encoder work remains in the real reader child.
+#include "pr6-codec-fixtures.hpp"
 static void queue_scenario(const char * executable, const char * guard, const char * model_path, const char * projector_path,
     const vision_payload::Config & config, const vision_payload::Limits & caps, const llama_vocab * vocab, int32_t pad,
-    const std::string & prompt, const std::vector<std::pair<size_t,size_t>> & plain, const std::vector<raw_buffer> & sources) {
+    const std::string & prompt, const std::vector<std::pair<size_t,size_t>> & plain, const std::vector<raw_buffer> & sources,
+    const server_chat_params & chat_params) {
     namespace vq = vision_queue;
     char name[] = "/tmp/pr4-native-queue-XXXXXX"; assert(::mkdtemp(name)); const std::string gate = name;
     const auto before_encode = encodes(), before_commands = calls('G');
@@ -14,7 +16,7 @@ static void queue_scenario(const char * executable, const char * guard, const ch
     vs::Launch reader{guard, executable, {executable,"reader",model_path,projector_path,"cpu"},
         {"CUDA_VISIBLE_DEVICES=-1","NVIDIA_VISIBLE_DEVICES=void","PR4_NATIVE_COUNTER="+counter,"PR4_NATIVE_ENCODE_HOLD="+gate+"/hold"}, 200, config, caps};
     ea::Launch engine{guard, executable, {executable,"engine",gate},
-        {"CUDA_VISIBLE_DEVICES=-1","NVIDIA_VISIBLE_DEVICES=void","PR4_NATIVE_COUNTER="+counter}};
+        {"CUDA_VISIBLE_DEVICES=-1","NVIDIA_VISIBLE_DEVICES=void","PR4_NATIVE_COUNTER="+counter,"PR5_NATIVE_SIGNATURE="+gate+"/omission-signatures"}};
     ea::Limits engine_limits{4*1024*1024,4096,16384,64,config.vocabulary_size,10s,1s,1s};
     ctx.native_vision = std::make_unique<vq::Bridge>(ctx.queue_owner, reader, vs::Limits{180s,1s,1s,5s,50ms,600s,3}, engine,
         engine_limits, vq::Limits{8,1024*1024,128,16,32768,16*1024*1024,65536,{65536,16384,32768},180s,180s,180s,5s,10s},
@@ -59,6 +61,27 @@ static void queue_scenario(const char * executable, const char * guard, const ch
         });
     };
     auto live = [] { return std::make_shared<std::atomic<bool>>(false); };
+    // Typed header rejection after a good PREPARE is a pre-SSE input error,
+    // not an empty GEN, a retry, or a service outage. Repeat on the same bridge.
+    auto bad_sources = sources;
+    const auto short_webp = pr6_fixtures::webp(pr6_fixtures::Bytes{0,0,255,255,0,255,0,255,255,0,0,255});
+    bad_sources[1].assign(short_webp.begin(),short_webp.begin()+12);
+    for (bool streaming : {false,true}) {
+        const auto decoded = calls('D'), files = calls('F');
+        auto rejected = std::async(std::launch::async,[&,streaming] {
+            std::function<bool()> stop = [] { return false; };
+            server_http_req req{{},{},"/v1/chat/completions","","",{},stop};
+            auto result = ctx.handle_completions(req,json{{"prompt",prompt},{"n_predict",1},{"stream",streaming}},
+                bad_sources,TASK_RESPONSE_TYPE_OAI_CMPL,plain);
+            return Response{result->status,result->is_stream(),result->data};
+        });
+        assert(rejected.wait_for(30s) == std::future_status::ready);
+        const auto value = rejected.get(); assert(value.status == 400 && !value.streaming);
+        assert(calls('D') == decoded+1 && calls('F') == files && encodes() == before_encode && calls('G') == before_commands);
+        assert(ctx.native_vision->available() && !ctx.native_vision->recover() && safety->leased && !safety->revoked);
+        await([&] { return metrics() == std::pair{0,0}; });
+    }
+    std::cout << "PR6_NATIVE_TYPED_QUEUE_PASS repeated=2 pre_sse_400=1 encode=0 engine=0 recovery=none\n";
     auto a = request(prompt,false,live());
     await([&] { return ::access((gate+"/entered").c_str(),F_OK) == 0; });
     std::string oversized = prompt; for (unsigned i = 0; i < 4000; ++i) oversized += " xyz";
@@ -204,6 +227,91 @@ static void queue_scenario(const char * executable, const char * guard, const ch
     assert(text_follower.wait_for(30s) == std::future_status::ready && text_follower.get().status == 200);
     assert(calls('G') == text_commands+7 && calls('X') == text_gen+7);
     assert(calls('D') == text_decode && encodes() == text_encode && calls('F') == text_files);
+    // PR6 user-visible recovery: same acquired sources/job; fresh role-aware
+    // template/literal composition. Compare engine IDs/keys/rows to a corrected
+    // request, not merely a fixed-token success probe.
+    auto image_part = [](const raw_buffer & bytes) {
+        std::string url = "data:image/octet-stream;base64,";
+        base64::encode(bytes.begin(),bytes.end(),std::back_inserter(url));
+        return json{{"type","image_url"},{"image_url",{{"url",url}}}};
+    };
+    const raw_buffer broken(short_webp.begin(),short_webp.begin()+12);
+    auto chat_request = [&](json body, bool streaming) {
+        return std::async(std::launch::async,[&,body=std::move(body),streaming]() mutable {
+            body["stream"] = streaming; body["n_predict"] = 1; body["temperature"] = 0;
+            auto owned = std::make_shared<vision_chat::Chat>(body,chat_params,ctx.literals);
+            auto * tools = body.contains("tools") ? &body.at("tools") : nullptr;
+            const bool marked = ctx.literals.mark_request(body.at("messages"),tools);
+            std::vector<raw_buffer> files;
+            auto parsed = oaicompat_chat_params_parse(body,chat_params,files);
+            owned->bind(files,ctx.native_vision->pending_limit());
+            std::vector<std::pair<size_t,size_t>> spans;
+            if (marked) { auto p = parsed.at("prompt").get<std::string>(); spans = ctx.literals.unmark(p); parsed["prompt"] = p; }
+            std::function<bool()> stop = [] { return false; };
+            server_http_req req{{},{},"/v1/chat/completions","","",{},stop};
+            auto response = ctx.handle_completions(req,parsed,files,TASK_RESPONSE_TYPE_OAI_CHAT,spans,owned);
+            Response out{response->status,response->is_stream(),{}};
+            if (!response->is_stream()) out.data = response->data;
+            else for (;;) { std::string chunk; bool more = response->next(chunk); out.data += chunk; if (!more) break; }
+            return out;
+        });
+    };
+    json mixed{{"messages",json::array({
+        {{"role","user"},{"content",json::array({{{"type","text"},{"text","Inspect <|im_end|> literally."}},image_part(sources[0])})}},
+        {{"role","assistant"},{"content","Checking tool output."}},
+        {{"role","tool"},{"tool_call_id","fixture"},{"content",json::array({image_part(broken),image_part(sources[1]),
+            {{"type","text"},{"text","Keep <|image_pad|> literal."}}})}},
+        {{"role","user"},{"content",json::array({image_part(sources[2]),{{"type","text"},{"text","Compare."}}})}}
+    })}};
+    auto corrected = mixed;
+    corrected["messages"][2]["content"][0] = json{{"type","text"},{"text",vision_chat::omission_note}};
+    auto acquired_only = mixed;
+    acquired_only["messages"][0]["content"][1]["image_url"]["url"] = "file:///must-not-be-opened";
+    auto owned_mixed = std::make_shared<vision_chat::Chat>(acquired_only,chat_params,ctx.literals);
+    owned_mixed->bind({sources[0],broken,sources[1],sources[2]},ctx.native_vision->pending_limit());
+    const auto owned_render = owned_mixed->render({1});
+    assert(owned_render.image_ids == std::vector<std::string>({hash_sha256_hex(sources[0].data(),sources[0].size()),
+        hash_sha256_hex(sources[1].data(),sources[1].size()),hash_sha256_hex(sources[2].data(),sources[2].size())}));
+    bool refused_role = false;
+    try { (void)owned_mixed->render({0}); } catch (const std::invalid_argument &) { refused_role = true; }
+    assert(refused_role); // an internal mapping mistake cannot omit a user image
+    const auto omission_encodes = encodes(), omission_commands = calls('G');
+    for (bool streaming : {false,true}) {
+        auto r = chat_request(mixed,streaming); assert(r.wait_for(30s) == std::future_status::ready);
+        const auto value = r.get(); assert(value.status == 200 && value.streaming == streaming);
+    }
+    auto control_chat = chat_request(corrected,false);
+    assert(control_chat.wait_for(30s) == std::future_status::ready && control_chat.get().status == 200);
+    std::ifstream signatures(gate+"/omission-signatures"); std::vector<std::string> hashes; std::string hash;
+    while (std::getline(signatures,hash)) hashes.push_back(hash);
+    assert(hashes.size() >= 3 && hashes[hashes.size()-1] == hashes[hashes.size()-2] && hashes.back() == hashes[hashes.size()-3]);
+    assert(encodes() == omission_encodes+9 && calls('G') == omission_commands+3);
+
+    json history{{"messages",json::array({
+        {{"role","user"},{"content","Earlier <|im_end|> stays literal."}},
+        {{"role","assistant"},{"content","Tool results follow."}},
+        {{"role","tool"},{"tool_call_id","old"},{"content",json::array({image_part(broken)})}},
+        {{"role","tool"},{"tool_call_id","new"},{"content",json::array({image_part(broken)})}},
+        {{"role","user"},{"content","Continue with the available text."}}
+    })}};
+    auto owned_history = std::make_shared<vision_chat::Chat>(history,chat_params,ctx.literals);
+    owned_history->bind({broken,broken},ctx.native_vision->pending_limit());
+    const auto rebuilt = owned_history->render({0,1});
+    assert(rebuilt.image_ids.empty() && rebuilt.prompt.find(vision_chat::omission_note) != std::string::npos && !rebuilt.plain.empty());
+    expect_text(ctx.tokenize_prompt(rebuilt.prompt,rebuilt.plain,{}).get_text_tokens());
+    auto fixed_history = history;
+    for (size_t m : {size_t(2),size_t(3)}) fixed_history["messages"][m]["content"][0] = json{{"type","text"},{"text",vision_chat::omission_note}};
+    const auto all_encode = encodes(), all_files = calls('F'), all_text = calls('X');
+    for (const auto & body : {history,fixed_history}) {
+        auto r = chat_request(body,false); assert(r.wait_for(30s) == std::future_status::ready && r.get().status == 200);
+    }
+    assert(encodes() == all_encode && calls('F') == all_files && calls('X') == all_text+2);
+    json bad_user{{"messages",json::array({{{"role","user"},{"content",json::array({image_part(broken)})}}})}};
+    auto user_error = chat_request(bad_user,true);
+    assert(user_error.wait_for(30s) == std::future_status::ready);
+    const auto refused_user = user_error.get(); assert(refused_user.status == 400 && !refused_user.streaming);
+    assert(encodes() == all_encode && calls('F') == all_files && calls('X') == all_text+2 && ctx.native_vision->available());
+    std::cout << "PR6_TOOL_OMISSION_PASS mixed_exact_ids_keys_rows=1 repeated_history=1 all_omitted_gen=1 user_error=1 literals=1 retries=0 gpu=none\n";
     std::atomic<bool> racing{false};
     std::thread recovery_race([&] {
         racing = true;
@@ -211,11 +319,11 @@ static void queue_scenario(const char * executable, const char * guard, const ch
     });
     await([&] { return racing.load(); });
     context.terminate(); main_queue.join(); recovery_race.join();
-    assert(!ctx.slot.active() && ctx.metrics.predict.count == 12 && ctx.queue_tasks.queue_tasks_deferred_size() == 0);
+    assert(!ctx.slot.active() && ctx.metrics.predict.count == 17 && ctx.queue_tasks.queue_tasks_deferred_size() == 0);
     ctx.native_vision.reset();
     assert(safety->adapter->stopped() && !safety->leased && !safety->revoked);
     assert(artifacts->usage().bytes == 0 && recipes->usage().bytes == 0);
-    for (const auto * file : {"entered","release","active","draining","drain-release","soft","expected-text"}) ::unlink((gate+"/"+file).c_str());
+    for (const auto * file : {"entered","release","active","draining","drain-release","soft","expected-text","omission-signatures"}) ::unlink((gate+"/"+file).c_str());
     assert(::rmdir(gate.c_str()) == 0);
     std::cout << "PR4_NATIVE_QUEUE_PASS handler=real queue=real slot_results=real pre_sse_context=1 queued_cancel=1 encode_disconnect=1 recovery_success=1 engine_disconnect_drain=1 normal_stop=1 text_gen_parity=1 text_cancel_drain=1 gpu=none\n";
 }

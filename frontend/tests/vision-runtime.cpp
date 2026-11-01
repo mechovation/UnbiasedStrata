@@ -78,7 +78,43 @@ static int contained_reader_test(char ** argv) {
     using namespace strata_frontend;
     namespace vp = vision_protocol;
     // Explicit opt-in test seam; Runtime still requires real finite cgroups.
-    auto r = vision_runtime::Runtime::load(argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false);
+    const auto baseline = vision_runtime::Runtime::load(argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false);
+    assert(baseline.config.generation == vision_runtime::Runtime::load(
+        argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false).config.generation);
+    auto frozen_profile = parse(read_small(argv[2]));
+    frozen_profile["engine_environment"]["STRATA_FREEZE_EXPERTS"] = "1";
+    char profile_path[] = "/tmp/pr5-frozen-profile-XXXXXX";
+    int profile_fd = ::mkstemp(profile_path); assert(profile_fd >= 0);
+    const auto profile_bytes = frozen_profile.dump();
+    assert(::write(profile_fd, profile_bytes.data(), profile_bytes.size()) == ssize_t(profile_bytes.size()));
+    ::close(profile_fd);
+    const auto frozen = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false);
+    auto r = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {"--kv-whole"}, 64, 4, false);
+    ::unlink(profile_path);
+    assert(baseline.config.generation != frozen.config.generation && frozen.config.generation != r.config.generation);
+    assert(r.engine_args == std::vector<std::string>{"--kv-whole"});
+    assert(std::count(r.engine_environment.begin(), r.engine_environment.end(), "STRATA_FREEZE_EXPERTS=1") == 1);
+    for (const auto & value : baseline.engine_environment) assert(value.find("STRATA_FREEZE_EXPERTS=") != 0);
+    // The reader's immutable config binds engine settings, but the reader process
+    // must never receive the freeze flag as an environment variable itself.
+    for (const auto & value : r.reader_environment) assert(value.find("STRATA_FREEZE_EXPERTS=") != 0);
+    const std::string config_prefix = "STRATA_READER_CONFIG=";
+    const auto config_entry = std::find_if(r.reader_environment.begin(), r.reader_environment.end(),
+        [&](const auto & value) { return value.find(config_prefix) == 0; });
+    assert(config_entry != r.reader_environment.end());
+    auto resolved = parse(config_entry->substr(config_prefix.size()));
+    const auto & policy = resolved["reader_policy"];
+    assert(policy["image_policy"] == vision_image::policy);
+    assert(policy["normalization_workspace_bytes"] == r.reader_limits.source_pixels * vision_image::workspace_per_pixel);
+    const auto libraries = vision_image::libraries();
+    assert(policy["image_libraries"].size() == libraries.size());
+    for (size_t i = 0; i < libraries.size(); ++i) {
+        assert(policy["image_libraries"][i]["role"] == libraries[i].role);
+        assert(policy["image_libraries"][i]["sha256"] == hex(hash_file(libraries[i].path, std::filesystem::file_size(libraries[i].path))));
+    }
+    resolved.erase("generation"); assert(hash(resolved.dump()) == r.config.generation);
+    resolved["reader_policy"]["image_libraries"][0]["sha256"] = std::string(64, '0');
+    assert(hash(resolved.dump()) != r.config.generation);
     assert(number(parse(read_small(argv[2])), "cgroup_memory_max") == 8589934592ULL);
     assert(number(parse(read_small(argv[2])), "cgroup_pids_max") == 256);
     auto cpu = read_small("/sys/fs/cgroup/cpu.max", 64);
@@ -148,11 +184,38 @@ int main(int argc, char ** argv) {
         if (item.key().find("core_bytes") == std::string::npos) { p[item.key()] = 0u; rejects([&] { Runtime::settings(p); }); }
     }
     changed = fixture; changed["gpu_uuid"] = "GPU-RTX-3060"; rejects([&] { Runtime::settings(changed); });
+    changed = fixture; changed["source_pixels"] = number(fixture, "cgroup_memory_max") / strata_frontend::vision_image::workspace_per_pixel + 1;
+    rejects([&] { Runtime::settings(changed); });
+    changed = fixture; changed["source_dimension"] = uint64_t(INT32_MAX / 4) + 1;
+    rejects([&] { Runtime::settings(changed); });
     for (auto key : {"PATH", "HTTP_PROXY", "https_proxy", "OPENAI_API_KEY", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "STRATA_UNREVIEWED"}) {
         changed = fixture; changed["engine_environment"][key] = "do-not-echo";
         rejects([&] { Runtime::settings(changed); });
         changed = fixture; changed["reader_environment"][key] = "do-not-echo";
         rejects([&] { Runtime::settings(changed); });
+    }
+    // Omission is unchanged; only the exact engine opt-in is admitted. Upstream
+    // tests getenv presence, so accepting "0" would not be a valid off state.
+    assert(!fixture["engine_environment"].contains("STRATA_FREEZE_EXPERTS"));
+    validate_environment(Json::object(), true);
+    validate_environment(Json::object());
+    changed = fixture; changed["engine_environment"]["STRATA_FREEZE_EXPERTS"] = "1";
+    Runtime::settings(changed);
+    changed["reader_environment"]["STRATA_FREEZE_EXPERTS"] = "1";
+    rejects([&] { Runtime::settings(changed); });
+    rejects([] { validate_environment(Json{{"STRATA_FREEZE_EXPERTS", "1"}}); });
+    for (const Json & value : {Json("0"), Json(""), Json("01"), Json("true"), Json("2"), Json(" 1"), Json("1 "),
+                              Json(std::string("1\0", 2)), Json(1), Json(true), Json(nullptr), Json::array(), Json::object()}) {
+        for (auto role : {"engine_environment", "reader_environment"}) {
+            changed = fixture; changed[role]["STRATA_FREEZE_EXPERTS"] = value;
+            rejects([&] { Runtime::settings(changed); });
+        }
+    }
+    for (auto name : {"STRATA_FREEZE_EXPERT", "STRATA_FREEZE_EXPERTS_", "strata_freeze_experts", "STRATA_FREEZE_EXPERTS=1"}) {
+        for (auto role : {"engine_environment", "reader_environment"}) {
+            changed = fixture; changed[role][name] = "1";
+            rejects([&] { Runtime::settings(changed); });
+        }
     }
     validate_environment(Json{{"LD_LIBRARY_PATH", "/opt/reviewed/lib:/usr/lib"}, {"CUDA_MODULE_LOADING", "LAZY"},
         {"STRATA_IO_THREADS", "4"}, {"STRATA_RESIDENT_HEADROOM_GIB", "2"}});
@@ -163,6 +226,7 @@ int main(int argc, char ** argv) {
     validate_engine_args({"--native", "/models/qwen.gguf", "--max-context", "8192", "--vision",
         "--prompt-cache", "6", "--conversation-cache-min-tokens", "8000"});
     validate_engine_args({"--prompt-cache=6", "--conversation-cache-min-tokens=8000"});
+    validate_engine_args({"--kv-whole"});
     for (auto flag : {"--gpu", "--gpu=0", "--split", "--split-mode=none", "--device=0", "--tensor-split", "--main-gpu", "-mg", "--rpc", "--api-key", "--prompt", "--prompt-cache-file", "--conversation-cache-min-tokens-secret", "--model-url"})
         rejects([&] { validate_engine_args({flag, "do-not-echo"}); });
     rejects([] { validate_engine_args({std::string("--native\0bad", 12)}); });

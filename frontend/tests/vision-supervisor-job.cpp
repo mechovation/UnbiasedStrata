@@ -54,6 +54,7 @@ static vision_payload::Binding binding(unsigned occurrence, uint64_t handle = 0)
 }
 static int fake(const std::string & mode, uint64_t instance) {
     ::signal(SIGTERM, SIG_IGN);
+    const unsigned images = mode == "shared-shutdown" ? 1 : 2;
     wire::Channel channel(3);
     auto send = [&](wire::Kind kind, uint64_t id, uint64_t sequence, unsigned occurrence = 0, uint64_t handle = 0) {
         vision_commands::Payload payload;
@@ -83,7 +84,7 @@ static int fake(const std::string & mode, uint64_t instance) {
         const uint64_t id = 11 + request;
         uint64_t sequence = 0;
         std::array<wire::Frame, 2> sources;
-        for (unsigned i = 0; i < 2; ++i) {
+        for (unsigned i = 0; i < images; ++i) {
             sources[i] = receive(wire::Kind::prepare, id, ++sequence, i, 0, 1);
             assert(art::sealed_size(sources[i].fds[0], 6, caps.source_bytes) == art::Result::ok);
             if (mode == "prepare-cancel" || mode == "prepare-deadline" || mode == "prepare-timeout" ||
@@ -96,7 +97,7 @@ static int fake(const std::string & mode, uint64_t instance) {
         const bool refuse = mode == "refused" || mode == "sticky-refused" || mode == "release-timeout" ||
                             mode == "release-stale" || mode == "two-jobs" || mode == "recipe-budget";
         if (!refuse) {
-            for (unsigned i = 0; i < 2; ++i) {
+            for (unsigned i = 0; i < images; ++i) {
                 auto f = receive(wire::Kind::encode, id, ++sequence, i, 1000 + id * 2 + i, 1);
                 constexpr size_t length = 7 * 7 * 4 * sizeof(float);
                 struct stat status{}; assert(::fstat(f.fds[0], &status) == 0 && status.st_size == length);
@@ -104,7 +105,7 @@ static int fake(const std::string & mode, uint64_t instance) {
                 assert((seals & (F_SEAL_GROW | F_SEAL_SHRINK)) == (F_SEAL_GROW | F_SEAL_SHRINK));
                 void * mapping = ::mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, f.fds[0], 0);
                 assert(mapping != MAP_FAILED);
-                if (mode == "encode-cancel" || mode == "shutdown" || mode == "engine-died" ||
+                if (mode == "encode-cancel" || mode == "shutdown" || mode == "shared-shutdown" || mode == "engine-died" ||
                     (request == 1 && mode == "engine-health-encode")) {
                     signal_gate("encode"); blocked();
                 }
@@ -124,7 +125,7 @@ static int fake(const std::string & mode, uint64_t instance) {
             // Engine scenarios must not receive RELEASE until native engine drain
             // and parent authority handback. The parent checks its retained files.
         }
-        for (unsigned i = 0; i < 2; ++i) {
+        for (unsigned i = 0; i < images; ++i) {
             auto release = receive(wire::Kind::release, id, ++sequence, i, 1000 + id * 2 + i, 0);
             if (mode == "release-timeout") { signal_gate("release"); blocked(); }
             if (mode == "sticky-refused" && i == 0) {
@@ -230,6 +231,19 @@ static void scenario(const char * executable, const char * guard, const std::str
             auto control = std::make_shared<control::Request>(wire::Clock::now() + (mode == "prepare-deadline" ? 200ms : 10s));
             const io::Identity id{20 + request, supervisor.instance(), 11 + request};
             auto input = submission(id.job, control, budget, recipes);
+            std::shared_ptr<control::Request> live_follower;
+            vision_cache::Flights flights(1,2);
+            vision_cache::Flights::Held producer_ticket, follower_ticket;
+            if (mode == "shared-shutdown") {
+                input->inputs.resize(1);
+                input->cache = std::make_shared<vision_cache::Cache>(1,65536,budget,recipes);
+                live_follower = std::make_shared<control::Request>(deadline());
+                producer_ticket = flights.join({config,{}},control);
+                follower_ticket = flights.join({config,{}},live_follower);
+                input->flights = {producer_ticket};
+                input->work_control = std::make_shared<vision_cache::Interest>(input->flights);
+                input->encode = 30s; // shutdown must not wait for this phase deadline
+            }
             if (mode == "snapshot-budget") input->snapshot_bytes = 1;
             if (mode == "prepare-timeout") input->prepare = 150ms;
             if (mode == "release-timeout") input->cleanup = 150ms;
@@ -252,7 +266,7 @@ static void scenario(const char * executable, const char * guard, const std::str
             if (prepare_fails) events.take(control::Event::Kind::failed, id.task);
             else {
                 auto prepared = events.take(control::Event::Kind::prepared, id.task); assert(prepared.job == id.job);
-                held_recipe = supervisor.prepared(); assert(held_recipe && held_recipe->recipes.size() == 2);
+                held_recipe = supervisor.prepared(); assert(held_recipe && held_recipe->recipes.size() == (mode == "shared-shutdown" ? 1u : 2u));
                 assert(held_recipe->identity.instance == id.instance && held_recipe->recipes[0].metadata == metadata());
                 if (mode == "recipe-budget") retained.push_back(held_recipe);
                 auto wrong = id; ++wrong.job; assert(!supervisor.admit(wrong, true));
@@ -263,9 +277,16 @@ static void scenario(const char * executable, const char * guard, const std::str
                 if (mode == "sticky-refused") {
                     gate.await("release"); control->cancel(control::Reason::disconnect); gate.resume();
                 }
-                if (mode == "encode-cancel" || mode == "shutdown" || mode == "engine-died") {
+                if (mode == "encode-cancel" || mode == "shutdown" || mode == "shared-shutdown" || mode == "engine-died") {
                     gate.await("encode");
-                    if (mode == "shutdown") supervisor.shutdown();
+                    if (mode == "shutdown" || mode == "shared-shutdown") {
+                        const auto start = wire::Clock::now();
+                        supervisor.shutdown();
+                        if (live_follower) {
+                            events.take(control::Event::Kind::job_terminal,id.task);
+                            assert(wire::Clock::now() - start < 3s && !live_follower->observe());
+                        }
+                    }
                     else if (mode == "engine-died") supervisor.engine_died();
                     else control->cancel(control::Reason::disconnect);
                 }
@@ -291,10 +312,10 @@ static void scenario(const char * executable, const char * guard, const std::str
                 wait_for([&] { return supervisor.stop(99); });
                 events.take(control::Event::Kind::stopped, 99);
             }
-            if (mode != "prepare-cancel") events.take(control::Event::Kind::job_terminal, id.task);
+            if (mode != "prepare-cancel" && mode != "shared-shutdown") events.take(control::Event::Kind::job_terminal, id.task);
             auto terminal = supervisor.terminal(); assert(terminal && terminal->identity.job == id.job);
             const bool cancelled = mode == "rows" || mode == "prepare-cancel" || mode == "prepare-deadline" ||
-                mode == "encode-cancel" || mode == "sticky-refused" || mode == "shutdown" || mode == "engine-died";
+                mode == "encode-cancel" || mode == "sticky-refused" || mode == "shutdown" || mode == "shared-shutdown" || mode == "engine-died";
             const auto expected = cancelled ? job::Outcome::cancelled : refusal ? job::Outcome::refused : job::Outcome::failure;
             assert(terminal->outcome == expected);
             if (mode == "prepare-timeout" || mode == "release-timeout") assert(terminal->timed_out);
@@ -321,19 +342,25 @@ static void scenario(const char * executable, const char * guard, const std::str
     assert(budget->usage().bytes == 0 && budget->usage().artifacts == 0 && fd_count() == baseline);
     events.inbox->stop_accepting(); assert(events.inbox->settled());
 }
+#include "pr6-input-rejection.inc"
 #include "vision-supervisor-engine.inc"
 #include "vision-engine-adapter.inc"
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string(argv[1]) == "input-fake") return input_fake(argv[2],std::stoull(argv[3]));
     if (argc == 3 && std::string(argv[1]) == "adapter-fake") return adapter_fake(argv[2]);
     if (argc == 3 && std::string(argv[1]) == "engine-fake") return fake_engine(argv[2]);
     if (argc == 4 && std::string(argv[1]) == "fake") return fake(argv[2], std::stoull(argv[3]));
     assert(argc == 3);
     recipe_budget_tests();
+    for (const auto * mode : {"first","second","repeat","live-waiter","class-one","unknown","binding","fd",
+                             "cancel-before","release-timeout","prepare-budget","release-stale","release-error","proof-blocked","shutdown"})
+        input_scenario(argv[0],argv[2],mode);
+    std::cout << "PR6_INPUT_REJECTION_PASS scenarios=15 typed_cleanup=1 same_reader=1 faults_fatal=1 live_waiter=1 gpu=none\n";
     for (const auto * mode : {"rows", "refused", "sticky-refused", "two-jobs", "prepare-cancel", "prepare-deadline",
                              "prepare-timeout", "metadata", "duplicate", "snapshot-budget", "proof-blocked", "encode-cancel",
-                             "mapping", "nonfinite", "row-budget", "release-timeout", "release-stale", "shutdown", "engine-died", "recipe-budget"})
+                             "mapping", "nonfinite", "row-budget", "release-timeout", "release-stale", "shutdown", "shared-shutdown", "engine-died", "recipe-budget"})
         scenario(argv[0], argv[2], mode);
-    std::cout << "vision supervisor Job IO: PASS (20 CPU-only scenarios)\n";
+    std::cout << "vision supervisor Job IO: PASS (21 CPU-only scenarios, shared-reader shutdown bounded)\n";
     for (const auto * mode : {"engine-success", "engine-two", "engine-cancel", "engine-full", "engine-shutdown",
                              "engine-deadline", "engine-proof", "engine-not-sent", "engine-denied", "engine-uncertain",
                              "engine-error", "engine-eof", "engine-stop-fail", "engine-drain-timeout", "engine-active-death", "engine-reader-eof", "engine-stop",

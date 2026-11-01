@@ -10,7 +10,8 @@ using namespace strata_frontend;
 namespace io = vision_job_io;
 namespace art = vision_artifact;
 namespace wire = vision_protocol;
-namespace cache = vision_row_cache;
+namespace cache = vision_cache;
+static auto recipes = std::make_shared<io::RecipeBudget>(io::RecipeBudget::Usage{65536,64});
 using namespace std::chrono_literals;
 static std::atomic<bool> never{false};
 static auto until() { return wire::Clock::now() + 5s; }
@@ -26,7 +27,7 @@ static std::shared_ptr<const io::Encoded> run(uint64_t id, vision_payload::Confi
     const std::vector<bool> & misses, bool accepted, Counts & counts, bool nonfinite = false, bool budget_failure = false) {
     auto s = std::make_unique<io::Submission>();
     s->job = id; s->control = std::make_shared<vision_control::Request>(until());
-    s->artifacts = budget; s->recipes = std::make_shared<io::RecipeBudget>(io::RecipeBudget::Usage{16384, 8});
+    s->artifacts = budget; s->recipes = recipes;
     s->cache = rows_cache; s->limits = {8192, 4096, 4096}; s->snapshot_bytes = 8192;
     s->prepare = s->encode = s->cleanup = 3s;
     for (size_t i = 0; i < misses.size(); ++i) {
@@ -54,9 +55,9 @@ static std::shared_ptr<const io::Encoded> run(uint64_t id, vision_payload::Confi
             assert(vision_commands::build(kind,cfg,caps,binding(i),p,{100+i,7,7,token,token,meta}) == vision_commands::Result::ok);
             assert(child.send_borrowed({kind,uint32_t(p.bytes.size()),7,id,seq},p.bytes.data(),p.bytes.size(),nullptr,0,caps.payload_bytes,until(),never) == wire::IoResult::ok);
         };
-        for (unsigned i = 0; i < misses.size(); ++i) {
-            auto f = receive(wire::Kind::prepare,i,1); ++counts.prepared;
-            assert(art::sealed_size(f.fds[0],6,1024) == art::Result::ok); send(wire::Kind::prepared,i);
+        if (misses[0]) {
+            auto f = receive(wire::Kind::prepare,0,1); ++counts.prepared;
+            assert(art::sealed_size(f.fds[0],6,1024) == art::Result::ok); send(wire::Kind::prepared,0);
         }
         if (budget_failure) return; // no ENCODE/RELEASE possible; parent certifies teardown below
         if (accepted) for (unsigned i = 0; i < misses.size(); ++i) if (misses[i]) {
@@ -66,13 +67,11 @@ static std::shared_ptr<const io::Encoded> run(uint64_t id, vision_payload::Confi
             assert(::pwrite(f.fds[0],values.data(),sizeof(values),0) == ssize_t(sizeof(values)));
             send(wire::Kind::encoded,i); if (nonfinite) return;
         }
-        for (unsigned i = 0; i < misses.size(); ++i) {
-            auto f = receive(wire::Kind::release,i,0); ++counts.released; send(wire::Kind::released,i);
+        if (misses[0]) {
+            auto f = receive(wire::Kind::release,0,0); ++counts.released; send(wire::Kind::released,0);
         }
     });
-    auto before = rows_cache->stats();
     assert(session->prepare(channel,never));
-    assert(rows_cache->stats().hits == before.hits && rows_cache->stats().misses == before.misses); // PREPARE never probes cache
     auto success = session->admit(accepted,channel,never);
     std::shared_ptr<const io::Encoded> result;
     if (nonfinite || budget_failure) { assert(!success); reader.join(); session->reader_stopped(); }
@@ -99,57 +98,58 @@ static std::shared_ptr<const io::Encoded> run(uint64_t id, vision_payload::Confi
 int main() {
     config.generation.fill(0x31); config.device.fill(0x53);
     auto budget = std::make_shared<art::Budget>(art::Usage{100000,100});
-    auto c = std::make_shared<cache::Cache>(1,784,budget);
+    auto c = std::make_shared<cache::Cache>(1,784,budget,recipes);
     Counts n;
-    // Repeated source: every occurrence PREPAREs; sequential second occurrence hits.
+    // Cold duplicates reuse the real tokenizer recipe and completed rows.
     auto first = run(1,config,{},budget,c,{true,false},true,n);
-    assert(n.prepared == 2 && n.encoded == 1 && n.released == 2);
+    assert(n.prepared == 1 && n.encoded == 1 && n.released == 1);
     assert(first->rows[0] != first->rows[1]);
     auto second = run(2,config,{},budget,c,{false},true,n);
-    assert(second->rows[0] != first->rows[0] && n.encoded == 1 && n.released == 3);
-    auto stats = c->stats();
-    run(3,config,{},budget,c,{false},false,n); // refusal must not lookup/encode
-    assert(c->stats().hits == stats.hits && c->stats().misses == stats.misses && n.released == 4);
+    assert(second->rows[0] != first->rows[0] && n.encoded == 1 && n.released == 1 && n.prepared == 1);
+    run(3,config,{},budget,c,{false},false,n); // warm context refusal: no reader IPC
+    assert(n.prepared == 1 && n.encoded == 1 && n.released == 1);
     auto changed = config; changed.generation[0]++;
     auto third = run(4,changed,{},budget,c,{true},true,n);
     vision_payload::Digest other{}; other[0]=1;
     auto fourth = run(5,changed,other,budget,c,{true},true,n);
     assert(n.encoded == 3 && c->size() == 1);
-    cache::Cache::Key key{changed,other,{7,7,49,7},784};
+    cache::Key key{changed,other};
+    const vision_row_cache::Cache::Key row_key{changed,other,{7,7,49,7},784};
     auto held = c->find(key); assert(held);
     art::Artifact::Ptr copy;
     assert(art::Artifact::rows(*budget,{7,99,0,other},7,7,4,784,until(),never,copy) == art::Result::ok);
     std::atomic<bool> stop{true};
-    assert(cache::copy(held,key,*copy,until(),stop) == art::Result::cancelled);
-    assert(cache::copy(held,key,*copy,wire::Clock::now(),never) == art::Result::deadline);
-    auto mismatched=key; mismatched.source[0]++;
-    assert(cache::copy(held,mismatched,*copy,until(),never) == art::Result::invalid);
-    assert(cache::copy(held,key,*copy,until(),never) == art::Result::ok);
+    assert(vision_row_cache::copy(held->rows,row_key,*copy,until(),stop) == art::Result::cancelled);
+    assert(vision_row_cache::copy(held->rows,row_key,*copy,wire::Clock::now(),never) == art::Result::deadline);
+    auto mismatched=row_key; mismatched.source[0]++;
+    assert(vision_row_cache::copy(held->rows,mismatched,*copy,until(),never) == art::Result::invalid);
+    assert(vision_row_cache::copy(held->rows,row_key,*copy,until(),never) == art::Result::ok);
     assert(copy->finish_rows({7,100,0,other},7,7,4,until(),never) == art::Result::invalid); // cannot relabel a job
     assert(copy->finish_rows(copy->tag(),1,49,4,until(),never) == art::Result::invalid); // exact shape, not just bytes
     assert(copy->finish_rows(copy->tag(),7,7,4,until(),never) == art::Result::ok);
     copy.reset();
-    auto wrong=key; wrong.shape.x=1; wrong.shape.y=49; assert(!c->find(wrong)); // same bytes, wrong shape
-    wrong=key; wrong.config.width++; assert(!c->find(wrong));
+    auto wrong=key; wrong.config.width++; assert(!c->find(wrong));
     wrong=key; wrong.config.device[0]++; assert(!c->find(wrong));
     auto usage=budget->usage(); assert(c->evict_one()); assert(budget->usage().bytes == usage.bytes); // held after eviction
     first.reset(); second.reset(); third.reset(); fourth.reset();
     assert(budget->usage().bytes == 784); held.reset(); assert(budget->usage().bytes == 0);
-    auto fresh = std::make_shared<cache::Cache>(1,784,budget);
+    auto fresh = std::make_shared<cache::Cache>(1,784,budget,recipes);
     run(6,config,{},budget,fresh,{true},true,n,true); // finite validation before insertion
     assert(fresh->size() == 0 && budget->usage().bytes == 0);
     // Hard budget cannot refund an evicted but held row to admit a hit copy.
     auto tight = std::make_shared<art::Budget>(art::Usage{790,2});
-    auto tc = std::make_shared<cache::Cache>(1,784,tight);
+    auto tc = std::make_shared<cache::Cache>(1,784,tight,recipes);
     auto retained = run(7,config,{},tight,tc,{true},true,n);
     run(8,config,{},tight,tc,{false},true,n,false,true);
     assert(tc->size() == 0 && tight->usage().bytes == 784);
     retained.reset(); assert(tight->usage().bytes == 0);
     // Cache disabled/oversize is best effort: real ENCODE succeeds without storage.
-    auto disabled = std::make_shared<cache::Cache>(0,784,budget);
+    auto disabled = std::make_shared<cache::Cache>(0,784,budget,recipes);
     run(9,config,{},budget,disabled,{true},true,n); assert(!disabled->size());
-    auto small = std::make_shared<cache::Cache>(1,783,budget);
-    run(10,config,{},budget,small,{true},true,n); assert(!small->size());
+    auto small = std::make_shared<cache::Cache>(1,783,budget,recipes);
+    run(10,config,{},budget,small,{true},true,n); assert(small->size() == 1); // soft cap, not the hard ledger
+    small.reset();
     assert(budget->usage().bytes == 0);
-    std::cout << "vision native LATE cache: PASS (real PREPARE/admission/ENCODE/RELEASE; no model/GPU)\n";
+    assert(recipes->usage().bytes == 0 && recipes->usage().snapshots == 0);
+    std::cout << "vision native EARLY cache: PASS (zero warm PREPARE/ENCODE; exact admission; held budgets; no model/GPU)\n";
 }

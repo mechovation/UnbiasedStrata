@@ -30,8 +30,8 @@ for source in tests/vision-runtime.cpp vision_reader_main.cpp; do
     if [[ $source == vision_reader_main.cpp ]]; then extra=("$root/frontend/vision_reader.cpp"); fi
     # shellcheck disable=SC2086
     "${CXX:-c++}" -std=c++20 -D_GNU_SOURCE -DLLAMA_SUBPROCESS -DCPPHTTPLIB_OPENSSL_SUPPORT \
-        -O0 -pthread ${CXXFLAGS:-} "${includes[@]}" "$root/frontend/$source" "${extra[@]}" \
-        -o "$tmp/$name" "${libs[@]}" ${LDFLAGS:-} -lssl -lcrypto -ldl -lm
+        -O0 -pthread ${CXXFLAGS:-} "${includes[@]}" "$root/frontend/$source" "$root/frontend/vision_image.cpp" "${extra[@]}" \
+        -o "$tmp/$name" "${libs[@]}" ${LDFLAGS:-} -l:libwebpdemux.so -l:libwebp.so -l:libexif.so -l:libyuv.so -lssl -lcrypto -ldl -lm
  done
 CUDA_VISIBLE_DEVICES=-1 NVIDIA_VISIBLE_DEVICES=void timeout 30 "$tmp/vision-runtime" "$root/frontend/tests/data/vision-runtime-cpu.json"
 # Executable rejects all legacy modes and missing explicit config before native init.

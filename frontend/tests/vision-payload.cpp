@@ -40,6 +40,14 @@ int main() {
         auto p = occurrence(); u64(p, binding.handle); valid.push_back({kind, p});
     }
     auto prepare = occurrence(); u64(prepare, binding.source_bytes); valid.push_back({Kind::prepare, prepare});
+    auto rejected = prepare; u32(rejected,uint32_t(vp::InputError::webp_header));
+    valid.push_back({Kind::input_rejected,rejected});
+    for (uint32_t reason : {0u,2u,UINT32_MAX}) {
+        auto bad = rejected; corrupt(bad,76,4,reason); reject(Kind::input_rejected,bad);
+    }
+    for (auto mutation : {std::array<uint64_t,3>{32,4,3}, {36,1,0}, {68,8,511}}) {
+        auto bad = rejected; corrupt(bad,mutation[0],mutation[1],mutation[2]); reject(Kind::input_rejected,bad);
+    }
     for (Kind kind : {Kind::encode, Kind::encoded}) {
         auto p = occurrence(); u64(p, binding.handle); u32(p, 7); u32(p, 7); u32(p, config.width);
         u64(p, 7 * 7 * config.width * 4); valid.push_back({kind, p});

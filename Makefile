@@ -80,6 +80,7 @@ test: frontend
 	$(BUILD_DIR)-frontend/bin/picture_cache_test
 	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/unbiased-strata
 	bash frontend/tests/acquisition.sh
+	bash frontend/tests/vision-early-cache.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

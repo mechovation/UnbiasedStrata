@@ -119,5 +119,14 @@ int main(int argc, char ** argv) {
     assert(!matches(reply, Kind::encoded, 12, 35, 56));
     assert(!matches(reply, Kind::encoded, 12, 34, 57));
     assert(!matches(reply, Kind::prepared, 12, 34, 56));
+    reply.kind = Kind::input_rejected;
+    const auto typed_header = encode_header(reply); Header typed{};
+    assert(parse_header(typed_header.data(),typed_header.size(),1024,typed));
+    assert(matches(reply,Kind::prepared,12,34,56));
+    for (auto expected : {Kind::encoded,Kind::released,Kind::ready,Kind::quit})
+        assert(!matches(reply,expected,12,34,56));
+    reply.kind = static_cast<Kind>(11);
+    const auto unknown_header = encode_header(reply);
+    assert(!parse_header(unknown_header.data(),unknown_header.size(),1024,typed));
     std::cout << "clean-process/header foundations: PASS (25 threaded spawn cycles)\n";
 }
