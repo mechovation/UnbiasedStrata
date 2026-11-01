@@ -2279,23 +2279,10 @@ if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
   target_compile_definitions(strata-vision-reader PRIVATE _GNU_SOURCE)
   add_dependencies(unbiased-strata strata-process-guard strata-vision-reader)
 
-  add_executable(vision_image_test EXCLUDE_FROM_ALL frontend/tests/pr6-codec-libraries.cpp)
-  find_path(STRATA_IMAGE_TEST_JPEG_INCLUDE NAMES jpeglib.h)
-  find_path(STRATA_IMAGE_TEST_JPEG_CONFIG_INCLUDE NAMES jconfig.h PATH_SUFFIXES ${CMAKE_LIBRARY_ARCHITECTURE})
-  foreach(_include STRATA_IMAGE_TEST_JPEG_INCLUDE STRATA_IMAGE_TEST_JPEG_CONFIG_INCLUDE)
-    if(${_include})
-      target_include_directories(vision_image_test PRIVATE "${${_include}}")
-    endif()
-  endforeach()
-  find_library(STRATA_IMAGE_TEST_WEBPMUX_LIBRARY NAMES webpmux)
-  find_library(STRATA_IMAGE_TEST_JPEG_LIBRARY NAMES jpeg)
-  if(STRATA_IMAGE_TEST_WEBPMUX_LIBRARY AND STRATA_IMAGE_TEST_JPEG_LIBRARY)
-    target_link_libraries(vision_image_test PRIVATE strata_vision_image
-      ${STRATA_IMAGE_TEST_WEBPMUX_LIBRARY} ${STRATA_IMAGE_TEST_JPEG_LIBRARY})
-  else()
-    set_target_properties(vision_image_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
-    # Fixture encoders are not runtime dependencies; fail only if this test is built.
-    target_link_libraries(vision_image_test PRIVATE strata_vision_image webpmux jpeg)
+  # Optional local test targets live in the development workspace and are not
+  # published with this repository; the file below is ignored by design.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/frontend/tests/local-test-targets.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/frontend/tests/local-test-targets.cmake")
   endif()
 
   # The engine adapter against the fake engine (frontend/tests/fake-engine.py): no GPU, no model, no llama.cpp.

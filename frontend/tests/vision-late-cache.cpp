@@ -18,7 +18,7 @@ static auto until() { return wire::Clock::now() + 5s; }
 static vision_payload::Config config{{}, {}, 4, 32, 1024};
 static vision_payload::Limits caps{16384, 4, 16, 1024, 65536, {4096, 64, 4096, 16384, 32, 16 * 1024 * 1024}};
 static std::string metadata() {
-    std::ifstream f("frontend/tests/data/pr4-metadata/qwen-still-0.bin", std::ios::binary); assert(f);
+    std::ifstream f("frontend/tests/data/mtmd-metadata/qwen-still-0.bin", std::ios::binary); assert(f);
     return {std::istreambuf_iterator<char>(f), {}};
 }
 struct Counts { unsigned prepared = 0, encoded = 0, released = 0; };

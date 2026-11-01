@@ -28,7 +28,7 @@ static vp::Config config = [] {
 static vp::Limits caps{16384, 4, 16, 1024, 65536, {4096, 64, 4096, 16384, 32, 16 * 1024 * 1024}};
 static auto deadline() { return wire::Clock::now() + 3s; }
 static std::string metadata() {
-    std::ifstream file("frontend/tests/data/pr4-metadata/qwen-still-0.bin", std::ios::binary);
+    std::ifstream file("frontend/tests/data/mtmd-metadata/qwen-still-0.bin", std::ios::binary);
     assert(file); return {std::istreambuf_iterator<char>(file), {}};
 }
 static vp::Binding binding(unsigned occurrence, uint64_t handle = 0) {

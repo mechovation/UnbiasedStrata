@@ -46,7 +46,7 @@ static void signal_gate(const char * phase) {
 }
 [[noreturn]] static void blocked() { for (;;) ::pause(); }
 static std::string metadata() {
-    std::ifstream input("frontend/tests/data/pr4-metadata/qwen-still-0.bin", std::ios::binary); assert(input);
+    std::ifstream input("frontend/tests/data/mtmd-metadata/qwen-still-0.bin", std::ios::binary); assert(input);
     return {std::istreambuf_iterator<char>(input), {}};
 }
 static vision_payload::Binding binding(unsigned occurrence, uint64_t handle = 0) {

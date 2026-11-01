@@ -81,7 +81,7 @@ static void release_all(vj::Job & j) {
 }
 int main() {
     config.width = 4; config.pixel_stride = 32; config.vocabulary_size = 1024;
-    std::ifstream file("frontend/tests/data/pr4-metadata/qwen-still-0.bin", std::ios::binary); assert(file);
+    std::ifstream file("frontend/tests/data/mtmd-metadata/qwen-still-0.bin", std::ios::binary); assert(file);
     metadata.assign(std::istreambuf_iterator<char>(file), {});
     va::Budget budget({65536, 16});
     // Explicit text jobs keep admission/start/drain/terminal ownership, but issue

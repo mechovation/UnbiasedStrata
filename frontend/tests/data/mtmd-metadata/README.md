@@ -1,4 +1,4 @@
-# Real mtmd metadata fixtures for PR4
+# Real mtmd metadata fixtures
 
 These ten 84-byte files are **public `mtmd_input_chunk_save()` output**, not hand-written serialization. `vision-metadata-real.cpp` generated RGB inputs, used actual CPU preprocessing and isolated mtmd tokenization (`add_special=false`), preflighted the saved bytes, then loaded them through the public loader and checked counts/positions. The updated harness also validates PREPARED envelopes with real tokenizer-derived prefix/suffix IDs. Metadata mutations in the no-model test are rejection cases only.
 

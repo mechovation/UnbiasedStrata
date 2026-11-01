@@ -96,8 +96,8 @@ Recorded here because a client written for one of the two may notice.
   tokenizer metadata. No engine, SVE1 or IPC payload ABI changes, submodule update,
   default activation or synthetic warmup.
   `Makefile` adds the no-model cache/single-flight regressions to `make test`.
-  GPU-only qualification helpers under `frontend/tests/pr5-gpu-*` and
-  `vision-gpu-*` / `vision_gpu_fixtures.py` provide matched GPU row/token probes,
+  GPU-only qualification helpers in the development workspace (not published) provide
+  matched GPU row/token probes,
   phase counts, controlled reply-held cancellation and maintenance restoration;
   none is linked into shipped binaries. 44 paired projector cases and both real
   engines passed, including full-KV readerless/restart/fresh-encode gates. Poly

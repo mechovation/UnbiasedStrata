@@ -53,7 +53,7 @@ int main() {
         u64(p, 7 * 7 * config.width * 4); valid.push_back({kind, p});
     }
     for (unsigned fixture = 0; fixture < 10; ++fixture) {
-        std::ifstream file("frontend/tests/data/pr4-metadata/qwen-still-" + std::to_string(fixture) + ".bin", std::ios::binary);
+        std::ifstream file("frontend/tests/data/mtmd-metadata/qwen-still-" + std::to_string(fixture) + ".bin", std::ios::binary);
         assert(file); std::string blob((std::istreambuf_iterator<char>(file)), {});
         vm::Shape shape{};
         assert(vm::preflight(blob, binding.metadata_id, limits.metadata, shape));
