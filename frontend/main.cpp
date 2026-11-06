@@ -52,6 +52,11 @@ void usage() {
         "                         sizes its expert cache only if the encoder loads first; for cards with room\n"
         "  --native-vision FILE   opt-in supervised reader/engine candidate; explicit JSON resource profile required\n"
         "                         requires --mmproj, --image-max-tokens and companion reader/guard executables\n"
+        "  --native-vision-warmup  opt-in, off by default: before the reader reports READY it encodes one synthetic\n"
+        "                         2048x2048 picture so the projector's lazy GPU work happens at startup instead of on\n"
+        "                         the first real picture. Costs startup seconds and may cost expert-cache slots; it\n"
+        "                         changes the image-cache generation, so cached rows from an unwarmed run are cold.\n"
+        "                         Requires --native-vision and --mmproj-gpu; not yet GPU-qualified.\n"
         "  --picture-cache N      keep the encoded rows of the last N pictures (default 64, up to 1 GiB) so a chat\n"
         "                         that resends its pictures every turn encodes each once; 0 turns it off\n"
         "  --                     everything after it is passed to the engine; --serve is added\n"
@@ -90,6 +95,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> engine_args;
     std::vector<char *> llama_argv;
     bool mmproj_gpu = false; // the vision encoder on the card: only where the engine leaves room (a 48 GB card)
+    bool native_warmup = false; // opt-in only: a synthetic encoder encode in the native reader before READY
     long picture_cache = 64; // --picture-cache N: encoded pictures kept for the turns that resend them
     llama_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -113,6 +119,7 @@ int main(int argc, char ** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             native_profile = argv[++i]; continue;
         }
+        if (a == "--native-vision-warmup") { native_warmup = true; continue; }
         if (a == "--mmproj-gpu") {
             mmproj_gpu = true;
             continue;
@@ -169,6 +176,10 @@ int main(int argc, char ** argv) {
         params.model_alias.insert(model_name);
     }
 
+    if (native_warmup && (native_profile.empty() || !mmproj_gpu)) {
+        std::fprintf(stderr, "unbiased-strata: --native-vision-warmup requires --native-vision and --mmproj-gpu\n");
+        return 2;
+    }
     if (!native_profile.empty()) {
         if (params.n_threads_http < 1) {
             std::fprintf(stderr,"unbiased-strata: native mode requires an explicit --threads-http limit\n"); return 2;
@@ -186,7 +197,7 @@ int main(int argc, char ** argv) {
         if (!file_exists(guard) || !file_exists(reader)) {
             std::fprintf(stderr,"unbiased-strata: native companion executables are missing\n"); return 2;
         }
-        ctx_server.configure_native(native_profile,guard,reader);
+        ctx_server.configure_native(native_profile,guard,reader,native_warmup);
     }
     ctx_server.set_picture_cache((size_t) picture_cache, (size_t) 1 << 30);
     server_http_context ctx_http;

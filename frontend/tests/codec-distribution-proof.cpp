@@ -71,7 +71,7 @@ int main(int argc, char ** argv) {
         const char * search = std::getenv("LD_LIBRARY_PATH"); check(search);
         settings["reader_environment"]["LD_LIBRARY_PATH"] = search;
         { std::ofstream out(profile); out << settings.dump(); check(out.good()); }
-        const auto runtime = vr::Runtime::load(profile.string(), model.string(), projector.string(), "/usr/bin/true", {}, 64, 4, false);
+        const auto runtime = vr::Runtime::load(profile.string(), model.string(), projector.string(), "/usr/bin/true", {}, 64, 4, false, false);
         vr::Json invariant;
         const std::string prefix = "STRATA_READER_CONFIG=";
         for (const auto & value : runtime.reader_environment)

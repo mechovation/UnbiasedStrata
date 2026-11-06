@@ -154,6 +154,9 @@ struct Runtime {
     std::vector<std::string> engine_args;
     uint32_t image_tokens = 0, threads = 0, image_min_tokens = 0, batch_max_tokens = 0;
     bool gpu = false;
+    // Opt-in synthetic encoder encode before READY. Carried like `gpu`: the parent decides it from an
+    // explicit command-line flag, the reader re-verifies it from the same immutable document.
+    bool warmup = false;
 
     // Reads cgroup v2 limits in the current cgroup namespace. "max", absent
     // controllers and limits exceeding the explicitly reviewed ceiling fail closed.
@@ -172,13 +175,13 @@ struct Runtime {
     }
     static Runtime load(const std::string & profile_path, const std::string & model, const std::string & projector,
                         const std::string & engine, const std::vector<std::string> & args,
-                        uint32_t image_tokens, uint32_t threads, bool gpu) {
+                        uint32_t image_tokens, uint32_t threads, bool gpu, bool warmup) {
         try {
             auto p = parse(read_small(profile_path)); Runtime r = settings(p);
             r.model_path = canonical_path(model); r.projector_path = canonical_path(projector);
             r.engine_executable = canonical_path(engine); r.engine_args = args;
             require(::access(r.engine_executable.c_str(), X_OK) == 0);
-            r.image_tokens = image_tokens; r.threads = threads; r.gpu = gpu;
+            r.image_tokens = image_tokens; r.threads = threads; r.gpu = gpu; r.warmup = warmup;
             r.validate_operations(); r.validate_containment(); r.resolve(); return r;
         } catch (...) { invalid(); }
     }
@@ -187,7 +190,7 @@ struct Runtime {
     static Runtime reader_config(std::string_view json, const std::vector<std::string> & actual_environment) {
         try {
             const auto j = parse(json);
-            fields(j, {"profile", "model", "projector", "engine", "engine_args", "image_tokens", "threads", "gpu", "abi", "reader_policy", "engine_environment", "reader_environment", "family", "device", "model_sha256", "projector_sha256", "engine_sha256", "width", "stride", "vocabulary", "generation"});
+            fields(j, {"profile", "model", "projector", "engine", "engine_args", "image_tokens", "threads", "gpu", "warmup", "abi", "reader_policy", "engine_environment", "reader_environment", "family", "device", "model_sha256", "projector_sha256", "engine_sha256", "width", "stride", "vocabulary", "generation"});
             Runtime r = settings(j["profile"]);
             // Set limits BEFORE GGUF parsing, hashing or any backend initialization.
             r.apply_reader_rlimits();
@@ -197,6 +200,7 @@ struct Runtime {
             r.image_tokens = uint32_t(number(j, "image_tokens", INT32_MAX));
             r.threads = uint32_t(number(j, "threads", 256));
             require(j["gpu"].is_boolean()); r.gpu = j["gpu"].get<bool>();
+            require(j["warmup"].is_boolean()); r.warmup = j["warmup"].get<bool>();
             r.validate_operations();
             auto expected = r.environment(r.profile_["reader_environment"], true), actual = actual_environment;
             expected.push_back("STRATA_READER_CONFIG=" + std::string(json));
@@ -323,6 +327,9 @@ private:
     void validate_operations() const {
         require(image_tokens && image_tokens <= INT32_MAX && image_tokens <= wire_limits.metadata.grid_cells &&
                 threads && threads <= 256 && number(profile_, "image_min_tokens") <= image_tokens);
+        // A synthetic encode reserves GPU work buffers: without the card there is nothing to reserve and
+        // the request is a misconfiguration, not something to ignore silently.
+        require(!warmup || gpu);
         validate_engine_args(engine_args);
     }
     static std::string gg_string(const gguf_context * g, const char * name) {
@@ -369,10 +376,10 @@ private:
             }
         }
         Json resolved = {{"profile", profile_}, {"model", model_path}, {"projector", projector_path}, {"engine", engine_executable},
-            {"engine_args", engine_args}, {"image_tokens", image_tokens}, {"threads", threads}, {"gpu", gpu},
+            {"engine_args", engine_args}, {"image_tokens", image_tokens}, {"threads", threads}, {"gpu", gpu}, {"warmup", warmup},
             {"abi", std::string(pinned_abi) + "/ptr" + std::to_string(sizeof(void *)) + "/size" + std::to_string(sizeof(size_t)) +
                 (uint16_t(1) == *reinterpret_cast<const uint8_t *>(&endian_probe_) ? "/le" : "/be")},
-            {"reader_policy", {{"vocab_only", true}, {"n_gpu_layers", 0}, {"warmup", gpu}, {"print_timings", false},
+            {"reader_policy", {{"vocab_only", true}, {"n_gpu_layers", 0}, {"buffer_warmup", gpu}, {"synthetic_encode", gpu && warmup}, {"print_timings", false},
                 {"flash_attention", "auto"}, {"control_fd", 3}, {"vision_only", true}, {"merge", 2},
                 {"image_policy", vision_image::policy},
                 {"normalization_workspace_bytes", reader_limits.source_pixels * vision_image::workspace_per_pixel},

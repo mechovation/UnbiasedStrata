@@ -1,7 +1,7 @@
 // Focused, no-model CPU tests. data/vision-runtime-cpu.json is the minimal complete
 // example profile (no implicit numeric defaults). For actual CPU integration use
 // a cgroup-v2 4-CPU/8-GiB/pids=256 test container, never production or a GPU.
-// API: Runtime::load(profile, model, projector, engine, engine_args, 64, 4, false).
+// API: Runtime::load(profile, model, projector, engine, engine_args, 64, 4, gpu, warmup).
 // Pass engine_environment and reader_environment verbatim to clean launchers;
 // Supervisor reader argv is {absolute_reader_path}; it appends INSTANCE and maps FD3.
 // Runtime::load itself checks containment; validate_containment() may recheck it.
@@ -78,9 +78,9 @@ static int contained_reader_test(char ** argv) {
     using namespace strata_frontend;
     namespace vp = vision_protocol;
     // Explicit opt-in test seam; Runtime still requires real finite cgroups.
-    const auto baseline = vision_runtime::Runtime::load(argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false);
+    const auto baseline = vision_runtime::Runtime::load(argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false, false);
     assert(baseline.config.generation == vision_runtime::Runtime::load(
-        argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false).config.generation);
+        argv[2], argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false, false).config.generation);
     auto frozen_profile = parse(read_small(argv[2]));
     frozen_profile["engine_environment"]["STRATA_FREEZE_EXPERTS"] = "1";
     char profile_path[] = "/tmp/pr5-frozen-profile-XXXXXX";
@@ -88,8 +88,11 @@ static int contained_reader_test(char ** argv) {
     const auto profile_bytes = frozen_profile.dump();
     assert(::write(profile_fd, profile_bytes.data(), profile_bytes.size()) == ssize_t(profile_bytes.size()));
     ::close(profile_fd);
-    const auto frozen = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false);
-    auto r = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {"--kv-whole"}, 64, 4, false);
+    const auto frozen = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false, false);
+    auto r = vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {"--kv-whole"}, 64, 4, false, false);
+    // --native-vision-warmup is parent-directed and off by default. On a CPU reader it is a
+    // misconfiguration, never something to ignore: the encoder has no GPU buffers to reserve.
+    rejects([&] { vision_runtime::Runtime::load(profile_path, argv[3], argv[4], "/usr/bin/true", {}, 64, 4, false, true); });
     ::unlink(profile_path);
     assert(baseline.config.generation != frozen.config.generation && frozen.config.generation != r.config.generation);
     assert(r.engine_args == std::vector<std::string>{"--kv-whole"});
@@ -104,6 +107,9 @@ static int contained_reader_test(char ** argv) {
     assert(config_entry != r.reader_environment.end());
     auto resolved = parse(config_entry->substr(config_prefix.size()));
     const auto & policy = resolved["reader_policy"];
+    assert(resolved["warmup"].is_boolean() && resolved["warmup"].get<bool>() == false);
+    assert(policy["buffer_warmup"].is_boolean() && policy["buffer_warmup"].get<bool>() == false);
+    assert(policy["synthetic_encode"].is_boolean() && policy["synthetic_encode"].get<bool>() == false);
     assert(policy["image_policy"] == vision_image::policy);
     assert(policy["normalization_workspace_bytes"] == r.reader_limits.source_pixels * vision_image::workspace_per_pixel);
     const auto libraries = vision_image::libraries();
@@ -231,13 +237,13 @@ int main(int argc, char ** argv) {
         rejects([&] { validate_engine_args({flag, "do-not-echo"}); });
     rejects([] { validate_engine_args({std::string("--native\0bad", 12)}); });
     rejects([] { validate_engine_args({std::string(4097, 'x')}); });
-    rejects([&] { Runtime::load(argv[1], "/not-a-model", "/not-a-projector", "/bin/true", {}, 64, 4, false); });
+    rejects([&] { Runtime::load(argv[1], "/not-a-model", "/not-a-projector", "/bin/true", {}, 64, 4, false, false); });
     // Limit setup is in the child only; failure must never change parent limits.
     rlimit before{}; assert(::getrlimit(RLIMIT_CORE, &before) == 0);
     auto child = ::fork(); assert(child >= 0);
     if (!child) {
         Json j = {{"profile", fixture}, {"model", "/missing"}, {"projector", "/missing"}, {"engine", "/bin/true"},
-            {"engine_args", Json::array()}, {"image_tokens", 64u}, {"threads", 4u}, {"gpu", false}, {"abi", "bad"},
+            {"engine_args", Json::array()}, {"image_tokens", 64u}, {"threads", 4u}, {"gpu", false}, {"warmup", false}, {"abi", "bad"},
             {"reader_policy", Json::object()}, {"engine_environment", Json::array()}, {"reader_environment", Json::array()},
             {"family", "qwen4exp"}, {"device", "cpu"}, {"model_sha256", "bad"}, {"projector_sha256", "bad"}, {"engine_sha256", "bad"},
             {"width", 1u}, {"stride", 28u}, {"vocabulary", 1u}, {"generation", "bad"}};

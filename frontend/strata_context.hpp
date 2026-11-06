@@ -29,7 +29,8 @@ struct strata_context {
 
     // Opt-in supervised candidate, with an explicit finite resource profile. Does
     // not deploy or authorize GPU use; configure before start_engine/load.
-    void configure_native(const std::string & profile, const std::string & guard, const std::string & reader);
+    void configure_native(const std::string & profile, const std::string & guard, const std::string & reader,
+                          bool warmup = false);
 
     // Legacy: fork+exec before threads. Native: records launch for the owner in load().
     bool start_engine(const common_params & params, const std::string & engine_exe, const std::vector<std::string> & engine_args, std::string & err);

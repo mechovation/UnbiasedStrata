@@ -246,6 +246,7 @@ struct strata_context_impl {
     // Join before destroying vocabulary or the queue callback owner.
     std::unique_ptr<strata_frontend::vision_queue::Bridge> native_vision;
     std::string native_profile, native_guard, native_reader;
+    bool native_warmup = false; // --native-vision-warmup: off unless the operator asks for it
     std::atomic<bool> native_busy{false};
     std::shared_ptr<HttpBudget> native_http;
     std::shared_ptr<HttpBudget::Charge> admit_http(const server_http_req & req) {
@@ -1425,9 +1426,10 @@ strata_context::~strata_context() {
     if (impl->model) { llama_model_free(impl->model); impl->model = nullptr; }
 }
 
-void strata_context::configure_native(const std::string & profile, const std::string & guard, const std::string & reader) {
+void strata_context::configure_native(const std::string & profile, const std::string & guard, const std::string & reader,
+                                      bool warmup) {
     if (impl->native_vision || impl->engine.alive() || impl->model) throw std::logic_error("native configuration after startup");
-    impl->native_profile = profile; impl->native_guard = guard; impl->native_reader = reader;
+    impl->native_profile = profile; impl->native_guard = guard; impl->native_reader = reader; impl->native_warmup = warmup;
 }
 
 bool strata_context::start_engine(const common_params & params, const std::string & engine_exe,
@@ -1496,7 +1498,8 @@ bool strata_context::load(common_params & params, std::string & err) {
             namespace ea = strata_frontend::vision_engine_adapter;
             if (params.image_max_tokens <= 0 || params.cpuparams.n_threads <= 0) throw std::runtime_error("explicit native image/thread limits required");
             const auto runtime = vr::Runtime::load(I.native_profile, params.model.path, params.mmproj.path, I.engine_exe,
-                I.engine_args, uint32_t(params.image_max_tokens), uint32_t(params.cpuparams.n_threads), params.mmproj_use_gpu);
+                I.engine_args, uint32_t(params.image_max_tokens), uint32_t(params.cpuparams.n_threads), params.mmproj_use_gpu,
+                I.native_warmup);
             const auto pad = common_tokenize(I.vocab, "<|image_pad|>", false, true);
             I.image_pad_id = pad.size() == 1 ? pad[0] : -1;
             runtime.apply_parent_rlimits();

@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 extern char ** environ;
 namespace {
@@ -72,6 +73,42 @@ int run(int argc, char ** argv) {
     std::unique_ptr<mtmd_context, decltype(&mtmd_free)> ctx(
         mtmd_init_from_file(runtime.projector_path.c_str(), model.get(), cp), mtmd_free);
     vr::require(ctx && mtmd_support_vision(ctx.get()) && !mtmd_support_audio(ctx.get()) && mtmd_decode_use_mrope(ctx.get()));
+    // Opt-in only: --native-vision-warmup, off by default. The projector's lazy GPU work (graphs, cuBLAS/module
+    // first-use, work buffers for the largest shape) happens here instead of on the first real picture, before
+    // the reader publishes READY and so before the engine sizes its expert cache. A 2048-square picture sits
+    // far above any token cap; mtmd scales it to the configured image budget. Off unless the operator asks,
+    // because it costs startup seconds and can cost expert-cache slots. Failure is fatal on purpose: a reader
+    // that silently started unwarmed reintroduces the cost the flag exists to remove.
+    if (runtime.gpu) {
+        if (!runtime.warmup) std::fprintf(stderr, "strata-vision-reader: encoder warm-up off\n");
+        else {
+            const uint32_t side = 2048;
+            vr::require(side <= runtime.wire_limits.metadata.pixel_dimension &&
+                        uint64_t(side) * side <= runtime.wire_limits.metadata.pixels &&
+                        uint64_t(side) * side * 3 <= runtime.reader_limits.retained_rgb_bytes);
+            std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
+            std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)>
+                bitmap(mtmd_bitmap_init(side, side, rgb.data()), mtmd_bitmap_free);
+            std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)>
+                chunks(mtmd_input_chunks_init(), mtmd_input_chunks_free);
+            vr::require(bool(bitmap) && bool(chunks));
+            const std::string marker = mtmd_default_marker();
+            mtmd_input_text text{marker.c_str(), marker.size(), false, true};
+            const mtmd_bitmap * pictures[1] = { bitmap.get() };
+            vr::require(mtmd_tokenize(ctx.get(), chunks.get(), &text, pictures, 1) == 0);
+            const auto started = std::chrono::steady_clock::now();
+            int tokens = 0;
+            for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); ++c) {
+                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.get(), c);
+                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) continue;
+                vr::require(mtmd_encode_chunk(ctx.get(), chunk) == 0);
+                tokens = int(mtmd_input_chunk_get_n_tokens(chunk));
+            }
+            std::fprintf(stderr, "strata-vision-reader: encoder warm-up done: %d image tokens in %.1f s\n", tokens,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        }
+        std::fflush(stderr);
+    }
     return vision_reader::serve(ctx.get(), runtime.config, runtime.wire_limits, runtime.reader_limits, instance, 3);
 }
 } // namespace
