@@ -74,10 +74,11 @@ frontend:
 # backpressure, child exit, ERR) and the HTTP surface a coding agent touches (frontend/tests/e2e.sh).  Needs python3
 # and curl; no GPU and no model.  Runs in the CUDA-free build directory, so it works on the build box and on a laptop.
 test: frontend
-	cmake --build $(BUILD_DIR)-frontend -j $(JOBS) --target engine_test literals_test picture_cache_test
+	cmake --build $(BUILD_DIR)-frontend -j $(JOBS) --target engine_test literals_test picture_cache_test vision-test
 	$(BUILD_DIR)-frontend/bin/engine_test frontend/tests/fake-engine.py
 	$(BUILD_DIR)-frontend/bin/literals_test
 	$(BUILD_DIR)-frontend/bin/picture_cache_test
+	$(BUILD_DIR)-frontend/bin/vision-test --all
 	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/unbiased-strata
 	bash frontend/tests/acquisition.sh
 	bash frontend/tests/vision-early-cache.sh

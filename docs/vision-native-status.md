@@ -32,6 +32,12 @@ PR5/PR6 acceptance suite. Required third-party notices/licenses are included.
 Legacy remains the default. No engine implementation, llama.cpp pin, production
 settings, GPU reserve or PR7 synthetic warmup was changed.
 
+**Later workspace change (2026-11-01, this push):** an opt-in, off-by-default encoder warm-up flag
+`--native-vision-warmup` was added to the native reader path. It is not enabled in production and has had no
+GPU qualification; see [opt-in encoder warm-up](vision-native-warmup.md). Adding its field to the reader's
+immutable configuration document changes `generation`, so image rows cached by a build without that field are
+cold after this change.
+
 ## Validation completed before this checkpoint
 
 - Ordinary/UBSan CPU protocol, ownership, cache, cancellation, cleanup, handler/

@@ -2285,6 +2285,19 @@ if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
     include("${CMAKE_CURRENT_SOURCE_DIR}/frontend/tests/local-test-targets.cmake")
   endif()
 
+  # Consolidated CPU cases run alongside the legacy tests until parity is established.
+  add_executable(vision-test EXCLUDE_FROM_ALL frontend/tests/vision-test.cpp)
+  target_include_directories(vision-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
+  target_compile_features(vision-test PRIVATE cxx_std_20)
+  target_link_libraries(vision-test PRIVATE Threads::Threads)
+  # These assertions include side effects; Release builds must not compile them away.
+  target_compile_options(vision-test PRIVATE -UNDEBUG)
+  # Temporary parity target; remove when the legacy source is deleted.
+  add_executable(vision-clean-process-legacy EXCLUDE_FROM_ALL frontend/tests/clean-process.cpp)
+  target_compile_features(vision-clean-process-legacy PRIVATE cxx_std_20)
+  target_compile_options(vision-clean-process-legacy PRIVATE -UNDEBUG)
+  target_link_libraries(vision-clean-process-legacy PRIVATE Threads::Threads)
+
   # The engine adapter against the fake engine (frontend/tests/fake-engine.py): no GPU, no model, no llama.cpp.
   # `make test` builds and runs it, then frontend/tests/e2e.sh against the binary above.
   add_executable(engine_test EXCLUDE_FROM_ALL frontend/tests/engine_test.cpp)
